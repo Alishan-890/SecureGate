@@ -77,7 +77,13 @@ class DatabaseConnection:
 
 
 def connect(config):
-    database_url = os.environ.get("DATABASE_URL") or config.get("DATABASE_URL")
+    database_url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or os.environ.get("NEON_DATABASE_URL")
+        or os.environ.get("DATABASE_URL_UNPOOLED")
+        or config.get("DATABASE_URL")
+    )
     if config.get("TESTING") and config.get("DATABASE"):
         connection = sqlite3.connect(config["DATABASE"])
         connection.row_factory = sqlite3.Row
