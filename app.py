@@ -38,6 +38,9 @@ TEST_NAV = (
     ("csrf", "CSRF Testing"),
     ("zap", "OWASP ZAP Results"),
 )
+_DATABASE_INITIALIZED = False
+_LAST_SCHEMA_FAILURE = None
+_SCHEMA_FAILURE_STEPS = []
 
 app = Flask(__name__)
 app.config.update(
@@ -68,9 +71,10 @@ def get_db():
 
 @app.before_request
 def ensure_database_initialized():
+    global _DATABASE_INITIALIZED
     if request.endpoint == "healthz":
         return None
-    if app.config.get("TESTING") or app.extensions.get("securegate_database_ready"):
+    if app.config.get("TESTING") or _DATABASE_INITIALIZED:
         return None
     try:
         init_db()
@@ -78,6 +82,11 @@ def ensure_database_initialized():
         reference = log_database_error("initialization", error)
         app.logger.error("Database initialization reference=%s", reference)
         return "Database initialization is temporarily unavailable.", 503
+    if _LAST_SCHEMA_FAILURE is not None:
+        reference = log_database_error("initialization", _LAST_SCHEMA_FAILURE)
+        app.logger.error("Database schema reference=%s", reference)
+        return "Database initialization is temporarily unavailable.", 503
+    _DATABASE_INITIALIZED = True
     app.extensions["securegate_database_ready"] = True
     return None
 
@@ -142,11 +151,13 @@ def _mask_database_text(value):
 def log_database_error(context, error):
     reference = uuid.uuid4().hex[:12]
     details = _mask_database_text(traceback.format_exc())
+    original_error = error.__cause__ or error
     app.logger.error(
-        "Database error ref=%s context=%s type=%s message=%s\n%s",
+        "Database error ref=%s context=%s wrapper=%s original=%s message=%s\n%s",
         reference,
         context,
         type(error).__name__,
+        type(original_error).__name__,
         _mask_database_text(error),
         details,
     )
@@ -225,7 +236,14 @@ SQLITE_SCHEMA = """
 
 
 def init_db():
-    db = connect(app.config)
+    global _LAST_SCHEMA_FAILURE, _SCHEMA_FAILURE_STEPS
+    _LAST_SCHEMA_FAILURE = None
+    _SCHEMA_FAILURE_STEPS = []
+    try:
+        db = connect(app.config)
+    except (DatabaseError, RuntimeError) as error:
+        _LAST_SCHEMA_FAILURE = error
+        raise
     try:
         if db.postgres:
             migration = (BASE_DIR / "migrations" / "001_initial.sql").read_text(
@@ -310,6 +328,8 @@ def _run_schema_step(db, name, statement, parameters=()):
         return True
     try:
         savepoint = "sg_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        db.execute("SET LOCAL lock_timeout = '3s'")
+        db.execute("SET LOCAL statement_timeout = '8s'")
         db.execute(f"SAVEPOINT {savepoint}")
         db.execute(statement, parameters)
         db.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -317,6 +337,9 @@ def _run_schema_step(db, name, statement, parameters=()):
         return True
     except DatabaseError as error:
         db.rollback()
+        global _LAST_SCHEMA_FAILURE
+        _LAST_SCHEMA_FAILURE = error
+        _SCHEMA_FAILURE_STEPS.append(name)
         reference = log_database_error(f"schema step {name}", error)
         app.logger.error("Schema step failed name=%s reference=%s", name, reference)
         return False
@@ -332,34 +355,74 @@ def _product_catalog():
 
 
 def _seed_users(db):
-    if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] != 0:
+    try:
+        if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] != 0:
+            return
+    except DatabaseError as error:
+        global _LAST_SCHEMA_FAILURE
+        _LAST_SCHEMA_FAILURE = error
+        _SCHEMA_FAILURE_STEPS.append("seed_users_check")
+        log_database_error("schema step seed_users_check", error)
         return
     initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
     initial_password = os.environ.get("INITIAL_ADMIN_PASSWORD")
     if not (app.config.get("TESTING") or (initial_admin and initial_password)):
         return
     now = pkt_now_iso()
-    db.execute(
-        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-        (initial_admin or "admin", generate_password_hash(initial_password or "Admin@123"), now),
+    admin_parameters = (
+        initial_admin or "admin",
+        generate_password_hash(initial_password or "Admin@123"),
+        now,
     )
-    if app.config.get("TESTING"):
-        db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
-            ("student", generate_password_hash("Student@123"), now),
+    if db.postgres:
+        _run_schema_step(
+            db,
+            "seed_admin_user",
+            "INSERT INTO users (username, password_hash, role, created_at) "
+            "VALUES (?, ?, 'admin', ?)",
+            admin_parameters,
         )
+    else:
+        db.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+            admin_parameters,
+        )
+    if app.config.get("TESTING"):
+        student_parameters = ("student", generate_password_hash("Student@123"), now)
+        if db.postgres:
+            _run_schema_step(
+                db,
+                "seed_student_user",
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                student_parameters,
+            )
+        else:
+            db.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
+                student_parameters,
+            )
 
 
 def _seed_product(db, product_id, product):
-    db.execute(
-        "UPDATE products SET name = ?, category = ?, description = ?, price = ?, status = 'Active' WHERE id = ?",
-        (*product, product_id),
+    update_statement = (
+        "UPDATE products SET name = ?, category = ?, description = ?, "
+        "price = ?, status = 'Active' WHERE id = ?"
     )
+    if db.postgres:
+        if not _run_schema_step(db, f"update_product_{product_id}", update_statement, (*product, product_id)):
+            return
+    else:
+        db.execute(update_statement, (*product, product_id))
     if not db.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
-        db.execute(
-            "INSERT INTO products (id, name, category, description, price, status) VALUES (?, ?, ?, ?, ?, 'Active')",
-            (product_id, *product),
+        insert_statement = (
+            "INSERT INTO products (id, name, category, description, price, status) "
+            "VALUES (?, ?, ?, ?, ?, 'Active')"
         )
+        if db.postgres:
+            _run_schema_step(db, f"insert_product_{product_id}", insert_statement, (product_id, *product))
+        else:
+            db.execute(insert_statement, (product_id, *product))
 
 
 def log_event(event, result, username=None, user_id=None):
@@ -413,6 +476,7 @@ def handle_database_error(error):
 
 @app.route("/healthz")
 def healthz():
+    global _DATABASE_INITIALIZED
     database_url_set = any(
         os.environ.get(name)
         for name in (
@@ -430,17 +494,23 @@ def healthz():
     db_error_message = None
     diagnostic_error = None
     try:
-        if not app.extensions.get("securegate_database_ready"):
+        if not _DATABASE_INITIALIZED or app.config.get("TESTING"):
             init_db()
-            app.extensions["securegate_database_ready"] = True
+            if _LAST_SCHEMA_FAILURE is not None:
+                diagnostic_error = _LAST_SCHEMA_FAILURE
+            else:
+                _DATABASE_INITIALIZED = True
+                app.extensions["securegate_database_ready"] = True
         db = get_db()
         db.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         db.execute("SELECT 1 FROM security_tests LIMIT 1").fetchone()
-        schema_ok = True
+        schema_ok = diagnostic_error is None
     except (DatabaseError, RuntimeError) as error:
         diagnostic_error = error
         db_error_type = type(error).__name__
         log_database_error("healthz", error)
+    if diagnostic_error is not None and db_error_type is None:
+        db_error_type = type(diagnostic_error).__name__
     health_token = os.environ.get("HEALTHZ_TOKEN")
     supplied_token = request.args.get("token", "")
     diagnostics_enabled = bool(
@@ -462,6 +532,11 @@ def healthz():
     }
     if diagnostics_enabled:
         payload["db_error_message"] = db_error_message
+        payload["db_error_step"] = (
+            _SCHEMA_FAILURE_STEPS[-1]
+            if _SCHEMA_FAILURE_STEPS
+            else ("connection" if diagnostic_error is not None else None)
+        )
     return jsonify(payload), (200 if schema_ok else 503)
 
 
@@ -486,7 +561,10 @@ def security_headers(response):
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Strict-Transport-Security"] = (
+        "max-age=31536000; includeSubDomains"
+    )
     response.headers.pop("Server", None)
     return response
 
@@ -494,6 +572,31 @@ def security_headers(response):
 @app.route("/")
 def index():
     return redirect(url_for("dashboard" if current_user.is_authenticated else "login"))
+
+
+@app.route("/about")
+def about():
+    return render_template("about.html")
+
+
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html")
+
+
+@app.route("/robots.txt")
+def robots():
+    return (
+        "User-agent: *\n"
+        "Disallow: /search\n"
+        "Disallow: /reports\n"
+        "Disallow: /audit\n"
+        "Disallow: /evidence\n"
+        "Disallow: /admin\n"
+        "Disallow: /api\n",
+        200,
+        {"Content-Type": "text/plain; charset=utf-8"},
+    )
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -514,7 +617,7 @@ def register():
                 )
                 db.commit()
                 log_event("User registration", "SUCCESS", username)
-                flash("Registration complete. Please sign in.", "success")
+                flash("Registration successful, please sign in.", "success")
                 return redirect(url_for("login"))
             except DatabaseIntegrityError:
                 flash("Username already taken.", "danger")

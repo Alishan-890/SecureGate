@@ -78,6 +78,14 @@ The Vercel entry point is [api/index.py](api/index.py), configured by [vercel.js
 4. Optionally add `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` for first-deploy administrator provisioning.
 5. Deploy. The Vercel cold-start entry point applies the PostgreSQL migration before serving requests. Production databases are not seeded with demo users or sample products.
 
+## Safe Browsing review
+
+This is an educational Group J university project, not a real login portal.
+If a browser warning appears, review the public URL at
+<https://transparencyreport.google.com/safe-browsing/search> and submit a
+correction at <https://safebrowsing.google.com/safebrowsing/report_error/>.
+Do not submit real passwords or personal information to this test deployment.
+
 ## Pages
 
 Authentication, SQL injection, XSS, access-control, OWASP ZAP results, evidence, reports, product search, feedback, login history, and administrator logs/users are available from the dashboard. Normal users only see their own audit and login records; administrators can review system-wide logs. This is a controlled teaching platform; it should not be exposed to the public internet.

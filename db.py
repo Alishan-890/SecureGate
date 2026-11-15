@@ -130,7 +130,10 @@ def connect(config):
         database_url = normalize_database_url(database_url)
         for attempt in range(2):
             try:
-                connection = psycopg.connect(database_url)
+                connection = psycopg.connect(
+                    database_url,
+                    connect_timeout=10 if attempt == 0 else 3,
+                )
                 break
             except psycopg.OperationalError as error:
                 if attempt == 1:

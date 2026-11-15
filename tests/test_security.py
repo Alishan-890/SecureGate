@@ -246,6 +246,17 @@ class SecureGateSecurityTests(unittest.TestCase):
             self.assertIn(directive, csp)
         self.assertNotIn("cdn.jsdelivr.net", csp)
         self.assertNotIn("Server", headers)
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        self.assertIn("max-age=31536000", headers["Strict-Transport-Security"])
+
+    def test_public_project_pages_and_robots_policy(self):
+        self.assertEqual(self.client.get("/about").status_code, 200)
+        self.assertEqual(self.client.get("/privacy").status_code, 200)
+        robots = self.client.get("/robots.txt")
+        self.assertEqual(robots.status_code, 200)
+        for path in ("/search", "/reports", "/audit", "/evidence", "/admin", "/api"):
+            self.assertIn(f"Disallow: {path}".encode(), robots.data)
 
     def test_xss_and_sql_injection_handling(self):
         self.login()
