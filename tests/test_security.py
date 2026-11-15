@@ -1,11 +1,13 @@
+import os
 import re
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
-from app import app, init_db
+from app import DatabaseError, app, init_db
 from werkzeug.security import generate_password_hash
 
 
@@ -136,6 +138,24 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertTrue(payload["schema_ok"])
         self.assertNotIn(b"password", response.data.lower())
         self.assertNotIn(b"postgresql://", response.data.lower())
+
+    def test_healthz_detailed_error_requires_token(self):
+        app.extensions.pop("securegate_database_ready", None)
+        original_token = os.environ.get("HEALTHZ_TOKEN")
+        os.environ["HEALTHZ_TOKEN"] = "test-health-token"
+        try:
+            with patch("app.init_db", side_effect=DatabaseError("password=secret")):
+                hidden = self.client.get("/healthz")
+                detailed = self.client.get("/healthz?token=test-health-token")
+            self.assertNotIn(b"db_error_message", hidden.data)
+            self.assertIn(b"db_error_message", detailed.data)
+            self.assertNotIn(b"password=secret", detailed.data)
+            self.assertIn(b"DatabaseError", detailed.data)
+        finally:
+            if original_token is None:
+                os.environ.pop("HEALTHZ_TOKEN", None)
+            else:
+                os.environ["HEALTHZ_TOKEN"] = original_token
 
     def test_duplicate_username_has_friendly_error(self):
         token = self.csrf("/register")

@@ -1,5 +1,6 @@
 import os
 import re
+import hmac
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -130,11 +131,12 @@ def normalize_username(value):
 
 
 def _mask_database_text(value):
-    return re.sub(
+    masked = re.sub(
         r"(?i)(postgres(?:ql)?://)[^\s]+",
         r"\1[REDACTED]",
         str(value),
     )
+    return re.sub(r"(?i)(password\s*=\s*)[^\s,;]+", r"\1[REDACTED]", masked)
 
 
 def log_database_error(context, error):
@@ -224,95 +226,140 @@ SQLITE_SCHEMA = """
 
 def init_db():
     db = connect(app.config)
-    if db.postgres:
-        migration = (BASE_DIR / "migrations" / "001_initial.sql").read_text(
-            encoding="utf-8"
-        )
-        db.executescript(migration)
-        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
-        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE")
-        db.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'")
-        for column, definition in (
-            ("status", "VARCHAR(20) NOT NULL DEFAULT 'Not Run'"),
-            ("result", "VARCHAR(10)"),
-            ("details", "TEXT"),
-            ("finding", "TEXT"),
-            ("impact", "TEXT"),
-            ("evidence", "TEXT"),
-            ("applied_control", "TEXT"),
-            ("retest_result", "VARCHAR(10)"),
-            ("risk_level", "VARCHAR(20)"),
-            ("executed_at", "TIMESTAMPTZ"),
-        ):
-            db.execute(
-                f"ALTER TABLE security_tests ADD COLUMN IF NOT EXISTS {column} {definition}"
+    try:
+        if db.postgres:
+            migration = (BASE_DIR / "migrations" / "001_initial.sql").read_text(
+                encoding="utf-8"
             )
-        db.execute(
-            "ALTER TABLE login_history ALTER COLUMN success TYPE BOOLEAN "
-            "USING lower(success::text) IN ('1', 'true', 't')"
-        )
-    else:
-        db.executescript(SQLITE_SCHEMA)
-        user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
-        if "is_blocked" not in user_columns:
-            db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
-        if "last_login" not in user_columns:
-            db.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
-        product_columns = {
-            row[1] for row in db.execute("PRAGMA table_info(products)").fetchall()
-        }
-        if "status" not in product_columns:
-            db.execute("ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
-        test_columns = {
-            row[1] for row in db.execute("PRAGMA table_info(security_tests)").fetchall()
-        }
-        for column in (
-            "finding", "impact", "evidence", "applied_control", "retest_result",
-            "risk_level",
-        ):
-            if column not in test_columns:
-                db.execute(f"ALTER TABLE security_tests ADD COLUMN {column} TEXT")
-    db.execute(
-        "UPDATE security_tests SET status = 'Not Run' "
-        "WHERE status = 'Pending'"
-    )
-    if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
-        initial_password = os.environ.get("INITIAL_ADMIN_PASSWORD")
-        seed_test_users = app.config.get("TESTING")
-        if seed_test_users or (initial_admin and initial_password):
-            now = pkt_now_iso()
-            db.execute(
-                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-                (
-                    initial_admin or "admin",
-                    generate_password_hash(initial_password or "Admin@123"),
-                    now,
-                ),
+            steps = [
+                (f"migration_{index}", statement)
+                for index, statement in enumerate(migration.split(";"), start=1)
+                if statement.strip()
+            ]
+            steps.extend(
+                [
+                    ("users_last_login", "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ"),
+                    ("users_is_blocked", "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE"),
+                    ("products_status", "ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'"),
+                ]
             )
-            if seed_test_users:
-                db.execute(
-                    "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
-                    ("student", generate_password_hash("Student@123"), now),
+            for column, definition in (
+                ("status", "VARCHAR(20) NOT NULL DEFAULT 'Not Run'"),
+                ("result", "VARCHAR(10)"),
+                ("details", "TEXT"),
+                ("finding", "TEXT"),
+                ("impact", "TEXT"),
+                ("evidence", "TEXT"),
+                ("applied_control", "TEXT"),
+                ("retest_result", "VARCHAR(10)"),
+                ("risk_level", "VARCHAR(20)"),
+                ("executed_at", "TIMESTAMPTZ"),
+            ):
+                steps.append(
+                    (
+                        f"security_tests_{column}",
+                        f"ALTER TABLE security_tests ADD COLUMN IF NOT EXISTS {column} {definition}",
+                    )
                 )
-    product_catalog = [
+            steps.append(
+                (
+                    "login_history_success_boolean",
+                    "ALTER TABLE login_history ALTER COLUMN success TYPE BOOLEAN "
+                    "USING lower(success::text) IN ('1', 'true', 't')",
+                )
+            )
+            for name, statement in steps:
+                _run_schema_step(db, name, statement)
+        else:
+            db.executescript(SQLITE_SCHEMA)
+            user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+            if "is_blocked" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
+            if "last_login" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
+            product_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(products)").fetchall()
+            }
+            if "status" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
+            test_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(security_tests)").fetchall()
+            }
+            for column in (
+                "finding", "impact", "evidence", "applied_control", "retest_result",
+                "risk_level",
+            ):
+                if column not in test_columns:
+                    db.execute(f"ALTER TABLE security_tests ADD COLUMN {column} TEXT")
+        _run_schema_step(
+            db,
+            "normalize_pending_security_tests",
+            "UPDATE security_tests SET status = 'Not Run' WHERE status = 'Pending'",
+        )
+        _seed_users(db)
+        for product_id, product in enumerate(_product_catalog(), start=1):
+            _seed_product(db, product_id, product)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _run_schema_step(db, name, statement, parameters=()):
+    if not db.postgres:
+        db.execute(statement, parameters)
+        return True
+    try:
+        savepoint = "sg_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        db.execute(f"SAVEPOINT {savepoint}")
+        db.execute(statement, parameters)
+        db.execute(f"RELEASE SAVEPOINT {savepoint}")
+        db.commit()
+        return True
+    except DatabaseError as error:
+        db.rollback()
+        reference = log_database_error(f"schema step {name}", error)
+        app.logger.error("Schema step failed name=%s reference=%s", name, reference)
+        return False
+
+
+def _product_catalog():
+    return [
         ("Web Login Portal", "Authentication", "Secure login, session, and account protection module", 0.00),
         ("SQL Injection Test Module", "Injection", "Controlled parameterized-query injection testing module", 0.00),
         ("XSS Test Module", "Input Security", "Controlled input validation and output escaping test module", 0.00),
         ("Access Control Checker", "Authorization", "Role and protected-route authorization verification module", 0.00),
     ]
-    for product_id, product in enumerate(product_catalog, start=1):
+
+
+def _seed_users(db):
+    if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] != 0:
+        return
+    initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
+    initial_password = os.environ.get("INITIAL_ADMIN_PASSWORD")
+    if not (app.config.get("TESTING") or (initial_admin and initial_password)):
+        return
+    now = pkt_now_iso()
+    db.execute(
+        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+        (initial_admin or "admin", generate_password_hash(initial_password or "Admin@123"), now),
+    )
+    if app.config.get("TESTING"):
         db.execute(
-            "UPDATE products SET name = ?, category = ?, description = ?, price = ?, status = 'Active' WHERE id = ?",
-            (*product, product_id),
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
+            ("student", generate_password_hash("Student@123"), now),
         )
-        if not db.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
-            db.execute(
-                "INSERT INTO products (id, name, category, description, price, status) VALUES (?, ?, ?, ?, ?, 'Active')",
-                (product_id, *product),
-            )
-    db.commit()
-    db.close()
+
+
+def _seed_product(db, product_id, product):
+    db.execute(
+        "UPDATE products SET name = ?, category = ?, description = ?, price = ?, status = 'Active' WHERE id = ?",
+        (*product, product_id),
+    )
+    if not db.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
+        db.execute(
+            "INSERT INTO products (id, name, category, description, price, status) VALUES (?, ?, ?, ?, ?, 'Active')",
+            (product_id, *product),
+        )
 
 
 def log_event(event, result, username=None, user_id=None):
@@ -380,6 +427,8 @@ def healthz():
     )
     schema_ok = False
     db_error_type = None
+    db_error_message = None
+    diagnostic_error = None
     try:
         if not app.extensions.get("securegate_database_ready"):
             init_db()
@@ -389,18 +438,31 @@ def healthz():
         db.execute("SELECT 1 FROM security_tests LIMIT 1").fetchone()
         schema_ok = True
     except (DatabaseError, RuntimeError) as error:
+        diagnostic_error = error
         db_error_type = type(error).__name__
         log_database_error("healthz", error)
-    return jsonify(
-        {
-            "status": "ok" if schema_ok else "fail",
-            "db": "ok" if schema_ok else "fail",
-            "db_error_type": db_error_type,
-            "database_url_set": database_url_set,
-            "secret_key_set": secret_key_set,
-            "schema_ok": schema_ok,
-        }
-    ), (200 if schema_ok else 503)
+    health_token = os.environ.get("HEALTHZ_TOKEN")
+    supplied_token = request.args.get("token", "")
+    diagnostics_enabled = bool(
+        health_token
+        and supplied_token
+        and hmac.compare_digest(supplied_token, health_token)
+    )
+    if diagnostics_enabled and diagnostic_error is not None:
+        original_error = diagnostic_error.__cause__ or diagnostic_error
+        db_error_type = type(original_error).__name__
+        db_error_message = _mask_database_text(str(original_error))[:240]
+    payload = {
+        "status": "ok" if schema_ok else "fail",
+        "db": "ok" if schema_ok else "fail",
+        "db_error_type": db_error_type,
+        "database_url_set": database_url_set,
+        "secret_key_set": secret_key_set,
+        "schema_ok": schema_ok,
+    }
+    if diagnostics_enabled:
+        payload["db_error_message"] = db_error_message
+    return jsonify(payload), (200 if schema_ok else 503)
 
 
 def admin_required(view):
