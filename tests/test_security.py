@@ -245,6 +245,33 @@ class SecureGateSecurityTests(unittest.TestCase):
         )
         db.close()
 
+    def test_csrf_accepts_same_origin_without_referrer(self):
+        token = self.csrf("/login")
+        response = self.client.post(
+            "/login",
+            data={"username": "student", "password": "Student@123", "csrf_token": token},
+            headers={"Origin": "http://localhost"},
+        )
+        self.assertEqual(response.status_code, 302)
+
+    def test_csrf_accepts_valid_token_without_origin_or_referrer(self):
+        token = self.csrf("/login")
+        response = self.client.post(
+            "/login",
+            data={"username": "student", "password": "Student@123", "csrf_token": token},
+        )
+        self.assertEqual(response.status_code, 302)
+
+    def test_csrf_rejects_cross_origin_headers(self):
+        token = self.csrf("/login")
+        for header_name in ("Origin", "Referer"):
+            response = self.client.post(
+                "/login",
+                data={"username": "student", "password": "Student@123", "csrf_token": token},
+                headers={header_name: "https://evil.example/"},
+            )
+            self.assertEqual(response.status_code, 400)
+
     def test_cookie_flags(self):
         response = self.login()
         cookie = response.headers["Set-Cookie"]
@@ -278,7 +305,7 @@ class SecureGateSecurityTests(unittest.TestCase):
             self.assertIn(directive, csp)
         self.assertNotIn("cdn.jsdelivr.net", csp)
         self.assertNotIn("Server", headers)
-        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("max-age=31536000", headers["Strict-Transport-Security"])
 

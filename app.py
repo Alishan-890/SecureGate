@@ -10,6 +10,7 @@ from functools import wraps
 from math import ceil
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, url_for
 from flask_login import (
@@ -58,12 +59,51 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get(
         "SECUREGATE_HTTPS", "1" if os.environ.get("VERCEL") else "0"
     ) == "1",
+    WTF_CSRF_SSL_STRICT=False,
 )
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 csrf = CSRFProtect(app)
 login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.login_message_category = "warning"
+
+
+def _origin_matches_request(value):
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        request_host = request.host.rsplit("@", 1)[-1].lower()
+        request_hostname = request.host.split(":", 1)[0].lower()
+        request_port = request.host.rsplit(":", 1)[-1] if ":" in request.host else None
+        parsed_port = parsed.port
+        if parsed_port is None:
+            parsed_port = 443 if parsed.scheme == "https" else 80
+        if request_port is None:
+            request_port = 443 if request.scheme == "https" else 80
+        return (
+            parsed.netloc.lower() == request_host
+            or (
+                parsed.hostname.lower() == request_hostname
+                and str(parsed_port) == str(request_port)
+            )
+        )
+    except ValueError:
+        return False
+
+
+@app.before_request
+def validate_csrf_origin():
+    if request.method not in app.config["WTF_CSRF_METHODS"]:
+        return None
+    if not getattr(g, "csrf_valid", False):
+        return None
+    origin = request.headers.get("Origin")
+    referrer = request.headers.get("Referer")
+    supplied_origin = origin or referrer
+    if supplied_origin and not _origin_matches_request(supplied_origin):
+        raise CSRFError("The request origin does not match this site.")
+    return None
 
 
 def get_db():
@@ -607,7 +647,7 @@ def security_headers(response):
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Strict-Transport-Security"] = (
         "max-age=31536000; includeSubDomains"
     )
