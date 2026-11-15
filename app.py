@@ -1,12 +1,14 @@
 import os
 import re
+import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from math import ceil
 from collections import Counter
 from pathlib import Path
 
-from flask import Flask, abort, flash, g, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, url_for
 from flask_login import (
     LoginManager,
     UserMixin,
@@ -65,12 +67,15 @@ def get_db():
 
 @app.before_request
 def ensure_database_initialized():
+    if request.endpoint == "healthz":
+        return None
     if app.config.get("TESTING") or app.extensions.get("securegate_database_ready"):
         return None
     try:
         init_db()
     except (DatabaseError, RuntimeError) as error:
-        app.logger.error("Database initialization failed: %s", error, exc_info=True)
+        reference = log_database_error("initialization", error)
+        app.logger.error("Database initialization reference=%s", reference)
         return "Database initialization is temporarily unavailable.", 503
     app.extensions["securegate_database_ready"] = True
     return None
@@ -122,6 +127,28 @@ def pkt_now_iso():
 
 def normalize_username(value):
     return value.strip().casefold()
+
+
+def _mask_database_text(value):
+    return re.sub(
+        r"(?i)(postgres(?:ql)?://)[^\s]+",
+        r"\1[REDACTED]",
+        str(value),
+    )
+
+
+def log_database_error(context, error):
+    reference = uuid.uuid4().hex[:12]
+    details = _mask_database_text(traceback.format_exc())
+    app.logger.error(
+        "Database error ref=%s context=%s type=%s message=%s\n%s",
+        reference,
+        context,
+        type(error).__name__,
+        _mask_database_text(error),
+        details,
+    )
+    return reference
 
 
 def parse_timestamp(value):
@@ -203,7 +230,27 @@ def init_db():
         )
         db.executescript(migration)
         db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE")
         db.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'")
+        for column, definition in (
+            ("status", "VARCHAR(20) NOT NULL DEFAULT 'Not Run'"),
+            ("result", "VARCHAR(10)"),
+            ("details", "TEXT"),
+            ("finding", "TEXT"),
+            ("impact", "TEXT"),
+            ("evidence", "TEXT"),
+            ("applied_control", "TEXT"),
+            ("retest_result", "VARCHAR(10)"),
+            ("risk_level", "VARCHAR(20)"),
+            ("executed_at", "TIMESTAMPTZ"),
+        ):
+            db.execute(
+                f"ALTER TABLE security_tests ADD COLUMN IF NOT EXISTS {column} {definition}"
+            )
+        db.execute(
+            "ALTER TABLE login_history ALTER COLUMN success TYPE BOOLEAN "
+            "USING lower(success::text) IN ('1', 'true', 't')"
+        )
     else:
         db.executescript(SQLITE_SCHEMA)
         user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
@@ -227,7 +274,7 @@ def init_db():
                 db.execute(f"ALTER TABLE security_tests ADD COLUMN {column} TEXT")
     db.execute(
         "UPDATE security_tests SET status = 'Not Run' "
-        "WHERE status = 'Pending' AND result IS NULL"
+        "WHERE status = 'Pending'"
     )
     if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
@@ -295,8 +342,8 @@ class User(UserMixin):
 def load_user(user_id):
     try:
         row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    except DatabaseError:
-        app.logger.exception("Unable to restore session user %s", user_id)
+    except DatabaseError as error:
+        log_database_error(f"session user {user_id}", error)
         db = g.pop("db", None)
         if db is not None:
             db.close()
@@ -306,11 +353,54 @@ def load_user(user_id):
 
 @app.errorhandler(DatabaseError)
 def handle_database_error(error):
-    app.logger.error("Database request failed: %s", error, exc_info=True)
+    reference = log_database_error("request", error)
     if current_user.is_authenticated:
         logout_user()
-    flash("Your session could not be restored. Please sign in again.", "warning")
+    flash(
+        f"Your session could not be restored. Please sign in again. "
+        f"Reference: {reference}",
+        "warning",
+    )
     return redirect(url_for("login"))
+
+
+@app.route("/healthz")
+def healthz():
+    database_url_set = any(
+        os.environ.get(name)
+        for name in (
+            "DATABASE_URL",
+            "POSTGRES_URL",
+            "NEON_DATABASE_URL",
+            "DATABASE_URL_UNPOOLED",
+        )
+    )
+    secret_key_set = bool(
+        os.environ.get("SECRET_KEY") or os.environ.get("SESSION_SECRET")
+    )
+    schema_ok = False
+    db_error_type = None
+    try:
+        if not app.extensions.get("securegate_database_ready"):
+            init_db()
+            app.extensions["securegate_database_ready"] = True
+        db = get_db()
+        db.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        db.execute("SELECT 1 FROM security_tests LIMIT 1").fetchone()
+        schema_ok = True
+    except (DatabaseError, RuntimeError) as error:
+        db_error_type = type(error).__name__
+        log_database_error("healthz", error)
+    return jsonify(
+        {
+            "status": "ok" if schema_ok else "fail",
+            "db": "ok" if schema_ok else "fail",
+            "db_error_type": db_error_type,
+            "database_url_set": database_url_set,
+            "secret_key_set": secret_key_set,
+            "schema_ok": schema_ok,
+        }
+    ), (200 if schema_ok else 503)
 
 
 def admin_required(view):
@@ -365,7 +455,7 @@ def register():
                 flash("Registration complete. Please sign in.", "success")
                 return redirect(url_for("login"))
             except DatabaseIntegrityError:
-                flash("That username is already registered.", "danger")
+                flash("Username already taken.", "danger")
     return render_template("register.html")
 
 

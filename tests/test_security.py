@@ -59,6 +59,106 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertEqual(login.status_code, 302)
         self.assertEqual(self.client.get("/dashboard").status_code, 200)
 
+    def test_existing_schema_is_upgraded_and_registration_still_works(self):
+        self.database.unlink()
+        old_schema = sqlite3.connect(self.database)
+        old_schema.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                created_at TEXT NOT NULL,
+                is_blocked INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                price REAL NOT NULL
+            );
+            CREATE TABLE security_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                test_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                result TEXT,
+                details TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                event TEXT NOT NULL,
+                result TEXT NOT NULL,
+                ip_address TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE login_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                ip_address TEXT,
+                login_at TEXT NOT NULL
+            );
+            INSERT INTO security_tests (user_id, test_name, status, created_at)
+            VALUES (1, 'Legacy test', 'Pending', '2026-01-01T00:00:00+00:00');
+            """
+        )
+        old_schema.commit()
+        old_schema.close()
+        init_db()
+        db = sqlite3.connect(self.database)
+        user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+        product_columns = {row[1] for row in db.execute("PRAGMA table_info(products)")}
+        status = db.execute("SELECT status FROM security_tests").fetchone()[0]
+        db.close()
+        self.assertIn("last_login", user_columns)
+        self.assertIn("status", product_columns)
+        self.assertEqual(status, "Not Run")
+
+    def test_healthz_reports_only_safe_diagnostics(self):
+        response = self.client.get("/healthz")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["db"], "ok")
+        self.assertTrue(payload["schema_ok"])
+        self.assertNotIn(b"password", response.data.lower())
+        self.assertNotIn(b"postgresql://", response.data.lower())
+
+    def test_duplicate_username_has_friendly_error(self):
+        token = self.csrf("/register")
+        self.client.post(
+            "/register",
+            data={
+                "username": "duplicate_user",
+                "password": "Duplicate@123",
+                "csrf_token": token,
+            },
+        )
+        token = self.csrf("/register")
+        response = self.client.post(
+            "/register",
+            data={
+                "username": "duplicate_user",
+                "password": "Duplicate@123",
+                "csrf_token": token,
+            },
+            follow_redirects=True,
+        )
+        self.assertIn(b"Username already taken", response.data)
+
     def test_wrong_password_is_recorded_as_boolean_failure(self):
         response = self.login("student", "WrongPassword@123")
         self.assertEqual(response.status_code, 200)

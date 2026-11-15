@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -127,10 +128,16 @@ def connect(config):
         except ImportError as error:
             raise RuntimeError("psycopg is required when DATABASE_URL is configured") from error
         database_url = normalize_database_url(database_url)
-        try:
-            connection = psycopg.connect(database_url)
-        except psycopg.Error as error:
-            raise DatabaseError(str(error)) from error
+        for attempt in range(2):
+            try:
+                connection = psycopg.connect(database_url)
+                break
+            except psycopg.OperationalError as error:
+                if attempt == 1:
+                    raise DatabaseError(str(error)) from error
+                time.sleep(0.15)
+            except psycopg.Error as error:
+                raise DatabaseError(str(error)) from error
         return DatabaseConnection(connection, postgres=True)
     raise RuntimeError(
         "DATABASE_URL must be configured for production. "
