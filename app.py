@@ -245,7 +245,8 @@ class User(UserMixin):
 def load_user(user_id):
     try:
         row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    except DatabaseError:
+    except DatabaseError as error:
+        app.logger.error("Unable to restore session user %s: %s", user_id, error)
         db = g.pop("db", None)
         if db is not None:
             db.close()
@@ -255,7 +256,7 @@ def load_user(user_id):
 
 @app.errorhandler(DatabaseError)
 def handle_database_error(error):
-    app.logger.error("Database request failed: %s", error)
+    app.logger.error("Database request failed: %s", error, exc_info=True)
     if current_user.is_authenticated:
         logout_user()
     flash("Your session could not be restored. Please sign in again.", "warning")

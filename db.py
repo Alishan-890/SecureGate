@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 class DatabaseError(Exception):
@@ -89,7 +90,17 @@ class DatabaseConnection:
         return self
 
     def commit(self):
-        self.connection.commit()
+        try:
+            self.connection.commit()
+        except sqlite3.Error as error:
+            raise DatabaseError(str(error)) from error
+        except Exception as error:
+            if self.postgres:
+                import psycopg
+
+                if isinstance(error, psycopg.Error):
+                    raise DatabaseError(str(error)) from error
+            raise
 
     def rollback(self):
         self.connection.rollback()
@@ -115,6 +126,7 @@ def connect(config):
             import psycopg
         except ImportError as error:
             raise RuntimeError("psycopg is required when DATABASE_URL is configured") from error
+        database_url = normalize_database_url(database_url)
         try:
             connection = psycopg.connect(database_url)
         except psycopg.Error as error:
@@ -124,6 +136,19 @@ def connect(config):
         "DATABASE_URL must be configured for production. "
         "Use the Neon PostgreSQL connection string."
     )
+
+
+def normalize_database_url(database_url):
+    """Normalize a Neon URL and require encrypted PostgreSQL connections."""
+    database_url = database_url.strip()
+    parsed = urlsplit(database_url)
+    if parsed.scheme in {"postgres", "postgresql+psycopg"}:
+        parsed = parsed._replace(scheme="postgresql")
+    if parsed.scheme not in {"postgresql", "postgresql+psycopg"}:
+        raise DatabaseError("DATABASE_URL must be a PostgreSQL connection string")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("sslmode", "require")
+    return urlunsplit(parsed._replace(query=urlencode(query)))
 
 
 def _postgres_integrity_error():
