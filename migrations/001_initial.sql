@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
+    last_login TIMESTAMPTZ,
     is_blocked BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -14,7 +15,8 @@ CREATE TABLE IF NOT EXISTS products (
     name TEXT NOT NULL,
     category TEXT NOT NULL,
     description TEXT NOT NULL,
-    price NUMERIC(10, 2) NOT NULL
+    price NUMERIC(10, 2) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Active'
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
@@ -46,7 +48,7 @@ CREATE TABLE IF NOT EXISTS security_tests (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id),
     test_name TEXT NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'Pending',
+    status VARCHAR(20) NOT NULL DEFAULT 'Not Run',
     result VARCHAR(10),
     details TEXT,
     finding TEXT,

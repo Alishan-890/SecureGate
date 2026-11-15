@@ -19,6 +19,7 @@
         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'search' %}active{% endif %}" href="{{ url_for('search') }}">Product Search</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'feedback' %}active{% endif %}" href="{{ url_for('feedback') }}">Feedback</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'login_history' %}active{% endif %}" href="{{ url_for('login_history') }}">Login History</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'audit_trail' %}active{% endif %}" href="{{ url_for('audit_trail') }}">Audit Trail</a></li>
         <li class="nav-item dropdown"><a class="nav-link dropdown-toggle" href="#" data-bs-toggle="dropdown">Security Tests</a>
           <ul class="dropdown-menu">
             {% for slug, label in test_nav %}<li><a class="dropdown-item" href="{{ url_for('testing', test_name=slug) }}">{{ label }}</a></li>{% endfor %}

@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app import app, init_db
+from werkzeug.security import generate_password_hash
 
 
 class SecureGateSecurityTests(unittest.TestCase):
@@ -132,10 +133,36 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertIn(b"Success", history.data)
         self.assertIn(b"Only your account activity is shown", history.data)
         pending = self.client.get("/testing/authentication")
-        self.assertIn(b"Pending", pending.data)
+        self.assertIn(b"Not Run", pending.data)
         self.assertNotIn(b"PASSED", pending.data)
         dashboard = self.client.get("/dashboard")
         self.assertIn(b"Recent security events", dashboard.data)
+        self.assertIn(b"Last login:", dashboard.data)
+        self.assertRegex(history.data.decode(), r"\d{2} [A-Z][a-z]{2} \d{4}, \d{2}:\d{2} [AP]M PKT")
+        self.assertEqual(self.client.get("/audit").status_code, 200)
+
+    def test_history_and_audit_are_isolated_by_user_id(self):
+        db = sqlite3.connect(app.config["DATABASE"])
+        db.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
+            ("other_user", generate_password_hash("OtherUser@123"), "2026-11-15T12:00:00+05:00"),
+        )
+        other_id = db.execute(
+            "SELECT id FROM users WHERE username = 'other_user'"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, ?, ?, ?)",
+            (other_id, True, "127.0.0.2", "2026-11-15T12:01:00+05:00"),
+        )
+        db.execute(
+            "INSERT INTO security_logs (user_id, username, event, result, created_at) VALUES (?, ?, ?, ?, ?)",
+            (other_id, "other_user", "Other user secret action", "SUCCESS", "2026-11-15T12:01:00+05:00"),
+        )
+        db.commit()
+        db.close()
+        self.login()
+        self.assertNotIn(b"Other user secret action", self.client.get("/audit").data)
+        self.assertEqual(self.client.get("/login-history").data.count(b"127.0.0.2"), 0)
 
     def test_dashboard_redirects_when_stale_session_has_no_database_schema(self):
         self.database.unlink()
@@ -204,6 +231,14 @@ class SecureGateSecurityTests(unittest.TestCase):
         report = self.client.get("/reports")
         for label in (b"Finding", b"Impact", b"Evidence", b"Applied fix", b"Retest result", b"PKT"):
             self.assertIn(label, report.data)
+
+    def test_login_history_success_values_are_recorded(self):
+        self.login()
+        db = sqlite3.connect(app.config["DATABASE"])
+        values = [row[0] for row in db.execute("SELECT success FROM login_history").fetchall()]
+        db.close()
+        self.assertIn(1, values)
+        self.assertTrue(all(value in (0, 1) for value in values))
 
     def test_admin_reset_clears_operational_data_but_preserves_users(self):
         self.login("admin", "Admin@123")

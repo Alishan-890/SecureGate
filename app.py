@@ -91,6 +91,11 @@ def inject_navigation():
 
 @app.template_filter("format_datetime")
 def format_datetime(value):
+    return pkt_time(value)
+
+
+@app.template_filter("pkt_time")
+def pkt_time(value):
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str):
@@ -102,7 +107,7 @@ def format_datetime(value):
         return value
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(PKT).strftime("%Y-%m-%d %H:%M:%S PKT")
+    return parsed.astimezone(PKT).strftime("%d %b %Y, %I:%M %p PKT")
 
 
 def pkt_now():
@@ -129,6 +134,7 @@ SQLITE_SCHEMA = """
             failed_attempts INTEGER NOT NULL DEFAULT 0,
             locked_until TEXT,
             created_at TEXT NOT NULL,
+            last_login TEXT,
             is_blocked INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS products (
@@ -136,7 +142,8 @@ SQLITE_SCHEMA = """
             name TEXT NOT NULL,
             category TEXT NOT NULL,
             description TEXT NOT NULL,
-            price REAL NOT NULL
+            price REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Active'
         );
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,7 +173,7 @@ SQLITE_SCHEMA = """
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             test_name TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Pending',
+            status TEXT NOT NULL DEFAULT 'Not Run',
             result TEXT,
             details TEXT,
             finding TEXT,
@@ -189,11 +196,20 @@ def init_db():
             encoding="utf-8"
         )
         db.executescript(migration)
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
+        db.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'")
     else:
         db.executescript(SQLITE_SCHEMA)
         user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
         if "is_blocked" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
+        if "last_login" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
+        product_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(products)").fetchall()
+        }
+        if "status" not in product_columns:
+            db.execute("ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
         test_columns = {
             row[1] for row in db.execute("PRAGMA table_info(security_tests)").fetchall()
         }
@@ -222,18 +238,22 @@ def init_db():
                     "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
                     ("student", generate_password_hash("Student@123"), now),
                 )
-    if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0 and (
-        app.config.get("TESTING") or os.environ.get("SEED_PRODUCTS") == "1"
-    ):
-        db.executemany(
-            "INSERT INTO products (name, category, description, price) VALUES (?, ?, ?, ?)",
-            [
-                ("Secure Coding Handbook", "Training", "Practical secure development guide", 29.99),
-                ("OWASP Testing Toolkit", "Tools", "Synthetic lab testing checklist", 49.50),
-                ("Blue Team Notebook", "Training", "Evidence and retest workbook", 15.00),
-                ("Threat Modeling Cards", "Training", "STRIDE-based workshop cards", 19.95),
-            ],
+    product_catalog = [
+        ("Web Login Portal", "Authentication", "Secure login, session, and account protection module", 0.00),
+        ("SQL Injection Test Module", "Injection", "Controlled parameterized-query injection testing module", 0.00),
+        ("XSS Test Module", "Input Security", "Controlled input validation and output escaping test module", 0.00),
+        ("Access Control Checker", "Authorization", "Role and protected-route authorization verification module", 0.00),
+    ]
+    for product_id, product in enumerate(product_catalog, start=1):
+        db.execute(
+            "UPDATE products SET name = ?, category = ?, description = ?, price = ?, status = 'Active' WHERE id = ?",
+            (*product, product_id),
         )
+        if not db.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone():
+            db.execute(
+                "INSERT INTO products (id, name, category, description, price, status) VALUES (?, ?, ?, ?, ?, 'Active')",
+                (product_id, *product),
+            )
     db.commit()
     db.close()
 
@@ -258,6 +278,7 @@ class User(UserMixin):
         self.id = row["id"]
         self.username = row["username"]
         self.role = row["role"]
+        self.last_login = row["last_login"]
 
 
 @login_manager.user_loader
@@ -371,10 +392,15 @@ def login():
             db.execute("UPDATE users SET locked_until = NULL, failed_attempts = 0 WHERE id = ?", (row["id"],))
             db.commit()
         if row and check_password_hash(row["password_hash"], password):
-            db.execute("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?", (row["id"],))
-            db.commit()
-            login_user(User(row))
             login_time = pkt_now_iso()
+            db.execute(
+                "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login = ? WHERE id = ?",
+                (login_time, row["id"]),
+            )
+            db.commit()
+            user = User(row)
+            user.last_login = login_time
+            login_user(user)
             db.execute(
                 "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, ?, ?, ?)",
                 (row["id"], True, request.remote_addr, login_time),
@@ -445,6 +471,18 @@ def dashboard():
         ).fetchone()[0],
         "retests": db.execute(
             "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND test_name LIKE '%Retest%' AND result = 'PASS'",
+            (current_user.id,),
+        ).fetchone()[0],
+        "tests_passed": db.execute(
+            "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND result = 'PASS'",
+            (current_user.id,),
+        ).fetchone()[0],
+        "tests_failed": db.execute(
+            "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND result = 'FAIL'",
+            (current_user.id,),
+        ).fetchone()[0],
+        "tests_not_run": db.execute(
+            "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND (status = 'Not Run' OR result IS NULL)",
             (current_user.id,),
         ).fetchone()[0],
     }
@@ -699,14 +737,14 @@ def testing(test_name):
     results = history or [
         {
             "test_name": name,
-            "status": "Pending",
+            "status": "Not Run",
             "result": None,
             "details": "Not executed yet",
             "finding": "Not assessed",
             "impact": "Not assessed",
             "evidence": "Not recorded",
             "applied_control": "Not applied",
-            "retest_result": "Pending",
+            "retest_result": "Not Run",
             "risk_level": "N/A",
             "executed_at": None,
         }
@@ -759,7 +797,10 @@ def reports():
 @app.route("/admin/users")
 @admin_required
 def admin_users():
-    users = get_db().execute("SELECT id, username, role, failed_attempts, locked_until, is_blocked, created_at FROM users ORDER BY id").fetchall()
+    users = get_db().execute(
+        "SELECT id, username, role, failed_attempts, locked_until, last_login, is_blocked, created_at "
+        "FROM users ORDER BY id"
+    ).fetchall()
     return render_template("admin_users.html", users=users)
 
 
@@ -773,7 +814,7 @@ def block_user(user_id):
     if user_id == current_user.id or row["role"] == "admin":
         flash("Administrators cannot block an administrator account.", "warning")
     else:
-        db.execute("UPDATE users SET is_blocked = 1 WHERE id = ?", (user_id,))
+        db.execute("UPDATE users SET is_blocked = ? WHERE id = ?", (True, user_id))
         db.commit()
         log_event("User blocked", "SUCCESS")
         flash(f"{row['username']} is now blocked.", "success")
@@ -787,7 +828,10 @@ def unblock_user(user_id):
     row = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
     if not row:
         abort(404)
-    db.execute("UPDATE users SET is_blocked = 0, failed_attempts = 0, locked_until = NULL WHERE id = ?", (user_id,))
+    db.execute(
+        "UPDATE users SET is_blocked = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?",
+        (False, user_id),
+    )
     db.commit()
     log_event("User unblocked", "SUCCESS")
     flash(f"{row['username']} is now unblocked.", "success")
@@ -826,6 +870,17 @@ def login_history():
         (current_user.id,),
     ).fetchall()
     return render_template("login_history.html", history=history)
+
+
+@app.route("/audit")
+@login_required
+def audit_trail():
+    logs = get_db().execute(
+        "SELECT event, result, ip_address, created_at FROM security_logs "
+        "WHERE user_id = ? ORDER BY id DESC",
+        (current_user.id,),
+    ).fetchall()
+    return render_template("audit.html", logs=logs)
 
 
 @app.route("/admin/login-history")
