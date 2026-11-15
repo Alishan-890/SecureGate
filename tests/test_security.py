@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from app import DatabaseError, app, init_db
+from app import DatabaseError, app, init_db, log_database_error
+from db import DatabaseConnection
 from werkzeug.security import generate_password_hash
 
 
@@ -141,6 +142,8 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertEqual(registered.status_code, 302)
         self.assertEqual(self.login("legacy_schema_user", "LegacyUser@123").status_code, 302)
         self.assertEqual(self.client.get("/dashboard").status_code, 200)
+        self.assertEqual(self.client.get("/login-history").status_code, 200)
+        self.assertEqual(self.client.get("/audit").status_code, 200)
 
     def test_products_are_correct_and_seed_is_idempotent(self):
         init_db()
@@ -415,6 +418,63 @@ class SecureGateSecurityTests(unittest.TestCase):
         response = self.client.get("/dashboard")
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["Location"].startswith("/login"))
+
+    def test_dashboard_database_error_returns_service_unavailable(self):
+        self.login()
+        original_execute = DatabaseConnection.execute
+
+        def fail_dashboard_query(connection, query, parameters=()):
+            if query.startswith("SELECT COUNT(*) FROM users"):
+                raise DatabaseError("dashboard query unavailable")
+            return original_execute(connection, query, parameters)
+
+        with patch.object(DatabaseConnection, "execute", fail_dashboard_query):
+            response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(b"Service temporarily unavailable", response.data)
+        self.assertNotIn(b"Your session could not be restored", response.data)
+
+    def test_last_login_failure_does_not_block_login(self):
+        original_execute = DatabaseConnection.execute
+
+        def fail_last_login(connection, query, parameters=()):
+            if query.startswith("UPDATE users SET failed_attempts"):
+                raise DatabaseError("last_login unavailable")
+            return original_execute(connection, query, parameters)
+
+        token = self.csrf("/login")
+        with patch.object(DatabaseConnection, "execute", fail_last_login):
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": "student",
+                    "password": "Student@123",
+                    "csrf_token": token,
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.client.get("/dashboard").status_code, 200)
+
+    def test_schema_migration_statuses_are_recorded(self):
+        db = sqlite3.connect(app.config["DATABASE"])
+        self.assertEqual(
+            db.execute(
+                "SELECT status FROM schema_migrations "
+                "WHERE step_name = 'normalize_pending_security_tests'"
+            ).fetchone()[0],
+            "done",
+        )
+        db.close()
+
+    def test_database_error_logs_do_not_include_connection_secrets(self):
+        with self.assertLogs("app", level="ERROR") as captured:
+            log_database_error(
+                "test",
+                DatabaseError("postgresql://user:password=secret@example/db password=secret"),
+            )
+        output = "\n".join(captured.output)
+        self.assertNotIn("password=secret", output)
+        self.assertIn("DatabaseError", output)
 
     def test_admin_can_block_and_unblock_users(self):
         self.login("admin", "Admin@123")

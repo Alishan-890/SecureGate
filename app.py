@@ -12,7 +12,19 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    g,
+    has_request_context,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_login import (
     LoginManager,
     UserMixin,
@@ -45,6 +57,7 @@ _DATABASE_INITIALIZED = False
 _LAST_SCHEMA_FAILURE = None
 _SCHEMA_FAILURE_STEPS = []
 SCHEMA_ADVISORY_LOCK = 918273645
+SCHEMA_VERSION = "001_initial"
 
 app = Flask(__name__)
 app.config.update(
@@ -126,9 +139,10 @@ def ensure_database_initialized():
         app.logger.error("Database initialization reference=%s", reference)
         return "Database initialization is temporarily unavailable.", 503
     if _LAST_SCHEMA_FAILURE is not None:
-        reference = log_database_error("initialization", _LAST_SCHEMA_FAILURE)
-        app.logger.error("Database schema reference=%s", reference)
-        return "Database initialization is temporarily unavailable.", 503
+        app.logger.warning(
+            "Database schema completed with failed steps=%s",
+            ",".join(_SCHEMA_FAILURE_STEPS),
+        )
     _DATABASE_INITIALIZED = True
     app.extensions["securegate_database_ready"] = True
     return None
@@ -195,9 +209,13 @@ def log_database_error(context, error):
     reference = uuid.uuid4().hex[:12]
     details = _mask_database_text(traceback.format_exc())
     original_error = error.__cause__ or error
+    route = request.endpoint if has_request_context() else "background"
+    user_id = session.get("_user_id") if has_request_context() else None
     app.logger.error(
-        "Database error ref=%s context=%s wrapper=%s original=%s message=%s\n%s",
+        "Database error ref=%s route=%s user_id=%s context=%s wrapper=%s original=%s message=%s\n%s",
         reference,
+        route or "unknown",
+        user_id,
         context,
         type(error).__name__,
         type(original_error).__name__,
@@ -305,10 +323,18 @@ def init_db():
                 encoding="utf-8"
             )
             steps = [
+                (
+                    "schema_migrations_table",
+                    "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                    "step_name TEXT PRIMARY KEY, status TEXT NOT NULL, "
+                    "details TEXT, updated_at TIMESTAMPTZ NOT NULL)",
+                )
+            ]
+            steps.extend(
                 (f"migration_{index}", statement)
                 for index, statement in enumerate(migration.split(";"), start=1)
                 if statement.strip()
-            ]
+            )
             steps.extend(
                 [
                     ("users_last_login", "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ"),
@@ -374,8 +400,6 @@ def init_db():
             _seed_product(db, product_id, product)
         db.commit()
     finally:
-        if schema_lock_acquired:
-            _release_schema_lock(db)
         db.close()
 
 
@@ -383,10 +407,11 @@ def _acquire_schema_lock(db):
     global _LAST_SCHEMA_FAILURE
     try:
         row = db.execute(
-            "SELECT pg_try_advisory_lock(?) AS acquired",
+            "SELECT pg_try_advisory_xact_lock(?) AS acquired",
             (SCHEMA_ADVISORY_LOCK,),
         ).fetchone()
-        db.commit()
+        if not row or not row["acquired"]:
+            db.commit()
         return bool(row and row["acquired"])
     except DatabaseError as error:
         db.rollback()
@@ -396,38 +421,72 @@ def _acquire_schema_lock(db):
         return False
 
 
-def _release_schema_lock(db):
-    try:
-        db.execute(
-            "SELECT pg_advisory_unlock(?)",
-            (SCHEMA_ADVISORY_LOCK,),
-        )
-        db.commit()
-    except DatabaseError as error:
-        log_database_error("schema step schema_unlock", error)
-
-
 def _run_schema_step(db, name, statement, parameters=()):
     if not db.postgres:
-        db.execute(statement, parameters)
+        try:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "step_name TEXT PRIMARY KEY, status TEXT NOT NULL, "
+                "details TEXT, updated_at TEXT NOT NULL)"
+            )
+            existing = db.execute(
+                "SELECT status FROM schema_migrations WHERE step_name = ?", (name,)
+            ).fetchone()
+            if existing and existing[0] in ("done", "skipped"):
+                return True
+            db.execute(statement, parameters)
+            db.execute(
+                "INSERT OR REPLACE INTO schema_migrations "
+                "(step_name, status, details, updated_at) VALUES (?, ?, ?, ?)",
+                (name, "done", None, pkt_now_iso()),
+            )
+        except DatabaseError as error:
+            db.rollback()
+            _SCHEMA_FAILURE_STEPS.append(name)
+            log_database_error(f"schema step {name}", error)
+            return False
         return True
+    savepoint = "sg_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
     try:
-        savepoint = "sg_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        existing = None
+        if name != "schema_migrations_table":
+            existing = db.execute(
+                "SELECT status FROM schema_migrations WHERE step_name = ?", (name,)
+            ).fetchone()
+        if existing and existing["status"] in ("done", "skipped"):
+            return True
         db.execute("SET LOCAL lock_timeout = '3s'")
         db.execute("SET LOCAL statement_timeout = '8s'")
         db.execute(f"SAVEPOINT {savepoint}")
         db.execute(statement, parameters)
         db.execute(f"RELEASE SAVEPOINT {savepoint}")
-        db.commit()
+        if name != "schema_migrations_table":
+            _record_schema_step(db, name, "done")
         return True
     except DatabaseError as error:
-        db.rollback()
         global _LAST_SCHEMA_FAILURE
+        try:
+            db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if name != "schema_migrations_table":
+                _record_schema_step(db, name, "failed", str(error))
+        except DatabaseError:
+            db.rollback()
         _LAST_SCHEMA_FAILURE = error
         _SCHEMA_FAILURE_STEPS.append(name)
         reference = log_database_error(f"schema step {name}", error)
         app.logger.error("Schema step failed name=%s reference=%s", name, reference)
         return False
+
+
+def _record_schema_step(db, name, status, details=None):
+    db.execute(
+        "INSERT INTO schema_migrations (step_name, status, details, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (step_name) DO UPDATE SET status = excluded.status, "
+        "details = excluded.details, updated_at = excluded.updated_at",
+        (name, status, details, pkt_now_iso()),
+    )
 
 
 def _product_catalog():
@@ -538,7 +597,12 @@ def load_user(user_id):
     try:
         row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     except DatabaseError as error:
-        log_database_error(f"session user {user_id}", error)
+        reference = log_database_error("session user load", error)
+        session.clear()
+        flash(
+            f"Your session could not be restored. Please sign in again. Reference: {reference}",
+            "warning",
+        )
         db = g.pop("db", None)
         if db is not None:
             db.close()
@@ -550,14 +614,16 @@ def load_user(user_id):
 def handle_database_error(error):
     step = _SCHEMA_FAILURE_STEPS[-1] if _SCHEMA_FAILURE_STEPS else "request"
     reference = log_database_error(f"request step={step}", error)
-    if current_user.is_authenticated:
-        logout_user()
-    flash(
-        f"Your session could not be restored. Please sign in again. "
-        f"Reference: {reference}",
-        "warning",
+    return (
+        render_template(
+            "error.html",
+            code=503,
+            message="Service temporarily unavailable. Please try again.",
+            reference=reference,
+            retry_url=request.url,
+        ),
+        503,
     )
-    return redirect(url_for("login"))
 
 
 @app.route("/healthz")
@@ -618,6 +684,8 @@ def healthz():
     }
     if diagnostics_enabled:
         payload["db_error_message"] = db_error_message
+        payload["schema_version"] = SCHEMA_VERSION
+        payload["schema_failed_steps"] = list(_SCHEMA_FAILURE_STEPS)
         payload["db_error_step"] = (
             _SCHEMA_FAILURE_STEPS[-1]
             if _SCHEMA_FAILURE_STEPS
@@ -878,11 +946,15 @@ def login():
             db.commit()
         if row and check_password_hash(row["password_hash"], password):
             login_time = pkt_now_iso()
-            db.execute(
-                "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login = ? WHERE id = ?",
-                (login_time, row["id"]),
-            )
-            db.commit()
+            try:
+                db.execute(
+                    "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login = ? WHERE id = ?",
+                    (login_time, row["id"]),
+                )
+                db.commit()
+            except DatabaseError as error:
+                db.rollback()
+                log_database_error("login last_login update", error)
             user = User(row)
             user.last_login = login_time
             login_user(user)
@@ -955,8 +1027,9 @@ def dashboard():
             (current_user.id,),
         ).fetchone()[0],
         "retests": db.execute(
-            "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND test_name LIKE '%Retest%' AND result = 'PASS'",
-            (current_user.id,),
+            "SELECT COUNT(*) FROM security_tests "
+            "WHERE user_id = ? AND test_name LIKE ? AND result = 'PASS'",
+            (current_user.id, "%Retest%"),
         ).fetchone()[0],
         "tests_passed": db.execute(
             "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND result = 'PASS'",
