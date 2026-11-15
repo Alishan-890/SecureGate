@@ -37,7 +37,10 @@ TEST_NAV = (
 
 app = Flask(__name__)
 app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY", "securegate-development-only-key"),
+    SECRET_KEY=os.environ.get(
+        "SECRET_KEY",
+        "static-super-secret-key-12345",
+    ),
     DATABASE_URL=os.environ.get("DATABASE_URL"),
     VULNERABLE_MODE=os.environ.get("SECUREGATE_VULNERABLE_MODE", "0") == "1",
     SESSION_COOKIE_HTTPONLY=True,
@@ -47,7 +50,7 @@ app.config.update(
     ) == "1",
 )
 csrf = CSRFProtect(app)
-login_manager = LoginManager(app)
+login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.login_message_category = "warning"
 
@@ -56,6 +59,22 @@ def get_db():
     if "db" not in g:
         g.db = connect(app.config)
     return g.db
+
+
+@app.before_request
+def ensure_database_initialized():
+    if app.config.get("TESTING") or app.extensions.get("securegate_database_ready"):
+        return None
+    try:
+        init_db()
+    except (DatabaseError, RuntimeError) as error:
+        app.logger.error("Database initialization failed: %s", error, exc_info=True)
+        return "Database initialization is temporarily unavailable.", 503
+    app.extensions["securegate_database_ready"] = True
+    return None
+
+
+login_manager.init_app(app)
 
 
 @app.teardown_appcontext
@@ -332,8 +351,8 @@ def login():
         now = pkt_now()
         if row and row["is_blocked"]:
             db.execute(
-                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, 0, ?, ?)",
-                (row["id"], request.remote_addr, pkt_now_iso()),
+                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, ?, ?, ?)",
+                (row["id"], False, request.remote_addr, pkt_now_iso()),
             )
             db.commit()
             log_event("Login attempt", "BLOCKED", username, row["id"])
@@ -357,16 +376,16 @@ def login():
             login_user(User(row))
             login_time = pkt_now_iso()
             db.execute(
-                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, 1, ?, ?)",
-                (row["id"], request.remote_addr, login_time),
+                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, ?, ?, ?)",
+                (row["id"], True, request.remote_addr, login_time),
             )
             db.commit()
             log_event("Login", "SUCCESS", username, row["id"])
             return redirect(url_for("dashboard"))
         if row:
             db.execute(
-                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, 0, ?, ?)",
-                (row["id"], request.remote_addr, pkt_now_iso()),
+                "INSERT INTO login_history (user_id, success, ip_address, login_at) VALUES (?, ?, ?, ?)",
+                (row["id"], False, request.remote_addr, pkt_now_iso()),
             )
             failures = row["failed_attempts"] + 1
             lock_until = (
@@ -513,14 +532,13 @@ def get_zap_summary():
 
 def evaluate_security_checks(test_name):
     db = get_db()
-    password_row = db.execute(
-        "SELECT password_hash FROM users WHERE username = 'student'"
-    ).fetchone()
     user_row = db.execute(
-        "SELECT role FROM users WHERE username = 'student'"
+        "SELECT role, password_hash FROM users WHERE role = ? ORDER BY id LIMIT 1",
+        ("user",),
     ).fetchone()
     admin_row = db.execute(
-        "SELECT role FROM users WHERE username = 'admin'"
+        "SELECT role FROM users WHERE role = ? ORDER BY id LIMIT 1",
+        ("admin",),
     ).fetchone()
     payload_count = db.execute(
         "SELECT COUNT(*) FROM products WHERE name = ?",
@@ -541,9 +559,9 @@ def evaluate_security_checks(test_name):
     ).status_code == 400
     checks = {
         "authentication": [
-            ("Password hashing", bool(password_row and (
-                password_row["password_hash"].startswith("scrypt:")
-                or password_row["password_hash"].startswith("pbkdf2:")
+            ("Password hashing", bool(user_row and (
+                user_row["password_hash"].startswith("scrypt:")
+                or user_row["password_hash"].startswith("pbkdf2:")
             )), "Plaintext passwords would be exposed", "Credential disclosure",
              "Stored password uses a Werkzeug password hash", "Werkzeug password hashing"),
             ("Session security", app.config["SESSION_COOKIE_HTTPONLY"]

@@ -34,6 +34,14 @@ def main():
             rows = source.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()
             if not rows:
                 continue
+            if table == "login_history" and "success" in columns:
+                success_index = columns.index("success")
+                rows = [
+                    row[:success_index]
+                    + (bool(row[success_index]),)
+                    + row[success_index + 1 :]
+                    for row in rows
+                ]
             placeholders = ", ".join(["%s"] * len(columns))
             target.executemany(
                 f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
