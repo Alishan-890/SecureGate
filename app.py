@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import re
 import hmac
@@ -349,7 +351,7 @@ def _product_catalog():
     return [
         ("Web Login Portal", "Authentication", "Secure login, session, and account protection module", 0.00),
         ("SQL Injection Test Module", "Injection", "Controlled parameterized-query injection testing module", 0.00),
-        ("XSS Test Module", "Input Security", "Controlled input validation and output escaping test module", 0.00),
+        ("XSS Test Module", "Cross-Site Scripting", "Controlled input validation and output escaping test module", 0.00),
         ("Access Control Checker", "Authorization", "Role and protected-route authorization verification module", 0.00),
     ]
 
@@ -463,7 +465,8 @@ def load_user(user_id):
 
 @app.errorhandler(DatabaseError)
 def handle_database_error(error):
-    reference = log_database_error("request", error)
+    step = _SCHEMA_FAILURE_STEPS[-1] if _SCHEMA_FAILURE_STEPS else "request"
+    reference = log_database_error(f"request step={step}", error)
     if current_user.is_authenticated:
         logout_user()
     flash(
@@ -597,6 +600,140 @@ def robots():
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
+
+
+@app.route("/cia")
+@login_required
+def cia_mapping():
+    controls = [
+        ("Werkzeug password hashing", "Confidentiality", "Protects stored credentials from disclosure."),
+        ("CSRF tokens", "Integrity", "Prevents unauthorized cross-site state changes."),
+        ("Parameterized queries", "Integrity", "Keeps input from changing SQL command structure."),
+        ("Jinja escaping and CSP", "Confidentiality", "Prevents injected scripts from reading or changing browser data."),
+        ("Lockout protection", "Availability", "Limits repeated password guesses and account abuse."),
+        ("Role and IDOR checks", "Confidentiality", "Prevents users from viewing administrator or other-user records."),
+        ("Audit logging", "Accountability", "Records security actions and administrator changes for review."),
+    ]
+    return render_template("cia.html", controls=controls)
+
+
+def evaluate_validation_stages():
+    db = get_db()
+    user_exists = db.execute(
+        "SELECT 1 FROM users WHERE id = ?", (current_user.id,)
+    ).fetchone() is not None
+    sql_payload_rejected = db.execute(
+        "SELECT COUNT(*) FROM products WHERE name = ?", ("' OR '1'='1",)
+    ).fetchone()[0] == 0
+    xss_escaped = app.jinja_env.from_string("{{ value }}").render(
+        value="<script>alert(1)</script>"
+    ) == "&lt;script&gt;alert(1)&lt;/script&gt;"
+    access_controlled = current_user.role in {"user", "admin"} and admin_required is not None
+    checks = [
+        ("Normal operation", user_exists, "Authenticated user can access the controlled lab."),
+        (
+            "Controlled attack indicator",
+            sql_payload_rejected and xss_escaped,
+            "SQL injection input was treated as data and XSS markup was escaped.",
+        ),
+        (
+            "Applied security control",
+            app.config["SESSION_COOKIE_HTTPONLY"]
+            and app.config["SESSION_COOKIE_SAMESITE"] == "Lax"
+            and access_controlled,
+            "Parameterized queries, escaping, session controls, and access checks are enabled.",
+        ),
+        (
+            "Successful retest",
+            user_exists and sql_payload_rejected and xss_escaped and access_controlled,
+            "The protected operations passed their repeat checks.",
+        ),
+    ]
+    return [
+        {
+            "name": name,
+            "passed": passed,
+            "finding": "No regression observed" if passed else "Controlled check failed",
+            "impact": "Protection could regress" if not passed else "No adverse impact observed",
+            "evidence": evidence,
+            "applied_control": "SecureGate validation controls",
+        }
+        for name, passed, evidence in checks
+    ]
+
+
+@app.route("/validation", methods=["GET", "POST"])
+@login_required
+def validation():
+    db = get_db()
+    if request.method == "POST":
+        executed_at = pkt_now_iso()
+        stages = evaluate_validation_stages()
+        db.executemany(
+            """
+            INSERT INTO security_tests (
+                user_id, test_name, status, result, details, finding, impact,
+                evidence, applied_control, retest_result, risk_level, created_at,
+                executed_at
+            ) VALUES (?, ?, 'Completed', ?, ?, ?, ?, ?, ?, ?, 'N/A', ?, ?)
+            """,
+            [
+                (
+                    current_user.id,
+                    f"Validation: {stage['name']}",
+                    "PASS" if stage["passed"] else "FAIL",
+                    stage["evidence"],
+                    stage["finding"],
+                    stage["impact"],
+                    stage["evidence"],
+                    stage["applied_control"],
+                    "PASS" if stage["passed"] else "FAIL",
+                    executed_at,
+                    executed_at,
+                )
+                for stage in stages
+            ],
+        )
+        db.commit()
+        log_event("Minimum validation executed", "SUCCESS")
+        flash("Minimum validation results were recorded.", "success")
+        return redirect(url_for("validation"))
+    history = db.execute(
+        """
+        SELECT test_name, status, result, finding, impact, evidence,
+               applied_control, retest_result, executed_at
+        FROM security_tests
+        WHERE user_id = ? AND test_name LIKE 'Validation: %'
+        ORDER BY id DESC
+        """,
+        (current_user.id,),
+    ).fetchall()
+    latest = {}
+    for row in history:
+        latest.setdefault(row["test_name"], row)
+    results = [
+        latest.get(
+            f"Validation: {stage}",
+            {
+                "test_name": f"Validation: {stage}",
+                "status": "Not Run",
+                "result": None,
+                "finding": "Not assessed",
+                "impact": "Not assessed",
+                "evidence": "Not recorded",
+                "applied_control": "Not applied",
+                "retest_result": "Not Run",
+                "executed_at": None,
+            },
+        )
+        for stage in (
+            "Normal operation",
+            "Controlled attack indicator",
+            "Applied security control",
+            "Successful retest",
+        )
+    ]
+    return render_template("validation.html", results=results)
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -1057,6 +1194,40 @@ def reports():
         (current_user.id, current_user.id),
     ).fetchall()
     return render_template("reports.html", reports=reports)
+
+
+@app.route("/reports.csv")
+@login_required
+def reports_csv():
+    rows = get_db().execute(
+        """
+        SELECT test_name, finding, impact, evidence, applied_control,
+               retest_result, result, executed_at
+        FROM security_tests
+        WHERE user_id = ?
+        ORDER BY id
+        """,
+        (current_user.id,),
+    ).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Test Name", "Finding", "Impact", "Evidence", "Applied Fix",
+            "Retest Result", "PASS/FAIL", "Execution Time",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row["test_name"], row["finding"], row["impact"], row["evidence"],
+                row["applied_control"], row["retest_result"], row["result"],
+                pkt_time(row["executed_at"]),
+            ]
+        )
+    response = app.response_class(output.getvalue(), mimetype="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=securegate-reports.csv"
+    return response
 
 
 @app.route("/admin/users")

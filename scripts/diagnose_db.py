@@ -74,7 +74,7 @@ def statements():
     products = (
         ("Web Login Portal", "Authentication", "Secure login, session, and account protection module"),
         ("SQL Injection Test Module", "Injection", "Controlled parameterized-query injection testing module"),
-        ("XSS Test Module", "Input Security", "Controlled input validation and output escaping test module"),
+        ("XSS Test Module", "Cross-Site Scripting", "Controlled input validation and output escaping test module"),
         ("Access Control Checker", "Authorization", "Role and protected-route authorization verification module"),
     )
     for product_id, (name, category, description) in enumerate(products, start=1):

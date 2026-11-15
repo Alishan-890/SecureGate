@@ -21,6 +21,23 @@ Run the security regression suite with:
 py -m unittest discover -s tests -v
 ```
 
+Pytest is also supported:
+
+```powershell
+py -m pytest -q
+```
+
+Optional authorised vulnerable-lab companions for coursework:
+
+```powershell
+docker run --rm -p 3000:3000 bkimminich/juice-shop
+docker run --rm -p 8080:80 vulnerables/web-dvwa
+```
+
+Use Juice Shop or DVWA only as separate local training targets. OWASP ZAP
+can be pointed at those local targets or this local SecureGate instance; do
+not scan systems without authorization.
+
 Test-only sample accounts (created when `TESTING=True`):
 
 | Username | Password | Role |
@@ -50,7 +67,7 @@ py scripts\migrate_sqlite_to_postgres.py
 - Consistent Pakistan Standard Time timestamps (`YYYY-MM-DD HH:MM:SS PKT`) for login history, feedback, tests, reports, evidence, and security logs.
 - Five consecutive incorrect passwords lock an account for 30 seconds and show a live remaining-seconds message.
 - Database-backed dashboard metrics, user-scoped audit/login history, and persisted security-test results.
-- Pending security tests that are marked PASS or FAIL only after execution, with findings, impact, evidence, applied controls, and retest results.
+- Not Run security tests that are marked PASS or FAIL only after execution, with findings, impact, evidence, applied controls, and retest results.
 - CSRF-protected administrator block/unblock actions with immediate database updates.
 - Security response headers including `X-Frame-Options` and `X-Content-Type-Options`.
 
@@ -89,3 +106,7 @@ Do not submit real passwords or personal information to this test deployment.
 ## Pages
 
 Authentication, SQL injection, XSS, access-control, OWASP ZAP results, evidence, reports, product search, feedback, login history, and administrator logs/users are available from the dashboard. Normal users only see their own audit and login records; administrators can review system-wide logs. This is a controlled teaching platform; it should not be exposed to the public internet.
+
+The `/validation` page demonstrates the four-stage Group J workflow and
+`/cia` maps implemented controls to confidentiality, integrity, availability,
+and accountability. Reports can be exported from `/reports.csv`.

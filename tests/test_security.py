@@ -129,6 +129,38 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertIn("last_login", user_columns)
         self.assertIn("status", product_columns)
         self.assertEqual(status, "Not Run")
+        token = self.csrf("/register")
+        registered = self.client.post(
+            "/register",
+            data={
+                "username": "legacy_schema_user",
+                "password": "LegacyUser@123",
+                "csrf_token": token,
+            },
+        )
+        self.assertEqual(registered.status_code, 302)
+        self.assertEqual(self.login("legacy_schema_user", "LegacyUser@123").status_code, 302)
+        self.assertEqual(self.client.get("/dashboard").status_code, 200)
+
+    def test_products_are_correct_and_seed_is_idempotent(self):
+        init_db()
+        init_db()
+        db = sqlite3.connect(app.config["DATABASE"])
+        products = db.execute(
+            "SELECT name, category FROM products ORDER BY id"
+        ).fetchall()
+        count = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        db.close()
+        self.assertEqual(
+            products,
+            [
+                ("Web Login Portal", "Authentication"),
+                ("SQL Injection Test Module", "Injection"),
+                ("XSS Test Module", "Cross-Site Scripting"),
+                ("Access Control Checker", "Authorization"),
+            ],
+        )
+        self.assertEqual(count, 4)
 
     def test_healthz_reports_only_safe_diagnostics(self):
         response = self.client.get("/healthz")
@@ -257,6 +289,21 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertEqual(robots.status_code, 200)
         for path in ("/search", "/reports", "/audit", "/evidence", "/admin", "/api"):
             self.assertIn(f"Disallow: {path}".encode(), robots.data)
+
+    def test_validation_cia_and_report_export_are_protected_and_recorded(self):
+        self.login()
+        self.assertEqual(self.client.get("/validation").status_code, 200)
+        self.assertIn(b"Not Run", self.client.get("/validation").data)
+        token = self.csrf("/validation")
+        executed = self.client.post(
+            "/validation", data={"csrf_token": token}, follow_redirects=True
+        )
+        self.assertEqual(executed.status_code, 200)
+        self.assertIn(b"Successful retest", executed.data)
+        self.assertEqual(self.client.get("/cia").status_code, 200)
+        report = self.client.get("/reports.csv")
+        self.assertEqual(report.status_code, 200)
+        self.assertIn(b"Test Name", report.data)
 
     def test_xss_and_sql_injection_handling(self):
         self.login()

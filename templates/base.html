@@ -27,6 +27,8 @@
         </li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'evidence' %}active{% endif %}" href="{{ url_for('evidence') }}">Evidence</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'reports' %}active{% endif %}" href="{{ url_for('reports') }}">Reports</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'validation' %}active{% endif %}" href="{{ url_for('validation') }}">Validation</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'cia_mapping' %}active{% endif %}" href="{{ url_for('cia_mapping') }}">CIA Mapping</a></li>
         {% if current_user.role == 'admin' %}
         <li class="nav-item dropdown"><a class="nav-link dropdown-toggle" data-bs-toggle="dropdown">Admin</a>
           <ul class="dropdown-menu"><li><a class="dropdown-item" href="{{ url_for('admin_users') }}">Users</a></li><li><a class="dropdown-item" href="{{ url_for('admin_login_history') }}">Login History</a></li><li><a class="dropdown-item" href="{{ url_for('admin_logs') }}">Security Logs</a></li></ul>

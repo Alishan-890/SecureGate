@@ -28,7 +28,7 @@ For each test, record the following sequence:
 6. Evidence stored in PostgreSQL.
 
 Execute the relevant test page from the dashboard, then confirm the result in
-`/evidence` and `/reports`. Tests start as `Pending`; they are not marked PASS
+`/evidence` and `/reports`. Tests start as `Not Run`; they are not marked PASS
 until the execution form is submitted.
 
 ## Approved test cases and controls

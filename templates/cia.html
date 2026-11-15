@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}CIA Mapping - SecureGate Student Security Lab{% endblock %}
+{% block content %}
+<div class="page-heading mb-4">
+  <div class="eyebrow">INFORMATION SECURITY</div>
+  <h1 class="h2 mt-2">CIA and accountability mapping</h1>
+  <p class="lead text-muted">How the implemented controls protect the university lab.</p>
+</div>
+<div class="card p-3 p-md-4">
+  <div class="table-wrap">
+    <table class="table"><thead><tr><th>Control</th><th>Property</th><th>Protection</th></tr></thead>
+      <tbody>{% for control, property, explanation in controls %}<tr><td>{{ control }}</td><td>{{ property }}</td><td>{{ explanation }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
