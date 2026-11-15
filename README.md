@@ -47,11 +47,21 @@ Test-only sample accounts (created when `TESTING=True`):
 
 Production requires `DATABASE_URL` and `SECRET_KEY`. Neon PostgreSQL is the supported production database. The application does not include public exploit endpoints.
 
-To migrate an existing development SQLite database once:
+To migrate an existing legacy development database once:
 
 ```powershell
 py scripts\migrate_sqlite_to_postgres.py
 ```
+
+To create or promote an administrator without putting credentials in source
+control, set `DATABASE_URL`, `SECRET_KEY`, `ADMIN_USERNAME`, and
+`ADMIN_PASSWORD` in the environment, then run:
+
+```powershell
+py scripts\create_admin.py
+```
+
+The script updates an existing username or creates it with the `admin` role.
 
 ## Security controls demonstrated
 

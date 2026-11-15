@@ -50,7 +50,7 @@ For the CSRF portion, open a form, copy no token, and submit a POST request with
 3. Search for the synthetic string `' OR '1'='1`.
 4. Open Admin > Security Logs as `admin`.
 
-**Expected result:** The normal search returns the matching product. The injection-like string is treated as ordinary text and returns no unauthorized rows. The application remains responsive because the query uses SQLite parameters.
+**Expected result:** The normal search returns the matching product. The injection-like string is treated as ordinary text and returns no unauthorized rows. The application remains responsive because the query uses PostgreSQL parameters.
 
 ## 6. XSS protection demonstration
 

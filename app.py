@@ -854,10 +854,10 @@ def validation():
         SELECT test_name, status, result, finding, impact, evidence,
                applied_control, retest_result, executed_at
         FROM security_tests
-        WHERE user_id = ? AND test_name LIKE 'Validation: %'
+        WHERE user_id = ? AND test_name LIKE ?
         ORDER BY id DESC
         """,
-        (current_user.id,),
+        (current_user.id, "Validation: %"),
     ).fetchall()
     latest = {}
     for row in history:
@@ -996,16 +996,6 @@ def logout():
 def dashboard():
     db = get_db()
     metrics = {
-        "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        "active_users": db.execute("SELECT COUNT(*) FROM users WHERE NOT is_blocked").fetchone()[0],
-        "blocked_users": db.execute("SELECT COUNT(*) FROM users WHERE is_blocked").fetchone()[0],
-        "login_attempts": db.execute("SELECT COUNT(*) FROM login_history").fetchone()[0],
-        "security_events": db.execute(
-            "SELECT COUNT(*) FROM security_logs WHERE user_id = ?", (current_user.id,)
-        ).fetchone()[0],
-        "feedback_count": db.execute(
-            "SELECT COUNT(*) FROM feedback WHERE user_id = ?", (current_user.id,)
-        ).fetchone()[0],
         "tests_executed": db.execute(
             "SELECT COUNT(*) FROM security_tests WHERE user_id = ? AND status = 'Completed'",
             (current_user.id,),
@@ -1044,8 +1034,23 @@ def dashboard():
             (current_user.id,),
         ).fetchone()[0],
     }
+    summary = {
+        "findings": metrics["findings_recorded"],
+        "controls": metrics["controls_applied"],
+        "retests": metrics["retests"],
+    }
+    admin_metrics = None
+    if current_user.role == "admin":
+        admin_metrics = {
+            "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "blocked_users": db.execute(
+                "SELECT COUNT(*) FROM users WHERE is_blocked"
+            ).fetchone()[0],
+            "login_attempts": db.execute("SELECT COUNT(*) FROM login_history").fetchone()[0],
+            "security_events": db.execute("SELECT COUNT(*) FROM security_logs").fetchone()[0],
+        }
     recent_logs = db.execute(
-        "SELECT * FROM security_logs WHERE user_id = ? ORDER BY id DESC LIMIT 6",
+        "SELECT * FROM security_logs WHERE user_id = ? ORDER BY id DESC LIMIT 5",
         (current_user.id,),
     ).fetchall()
     products = db.execute(
@@ -1054,9 +1059,26 @@ def dashboard():
     return render_template(
         "dashboard.html",
         metrics=metrics,
+        summary=summary,
+        admin_metrics=admin_metrics,
         recent_logs=recent_logs,
         products=products,
     )
+
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
+    db = get_db()
+    metrics = {
+        "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "blocked_users": db.execute(
+            "SELECT COUNT(*) FROM users WHERE is_blocked"
+        ).fetchone()[0],
+        "login_attempts": db.execute("SELECT COUNT(*) FROM login_history").fetchone()[0],
+        "security_events": db.execute("SELECT COUNT(*) FROM security_logs").fetchone()[0],
+    }
+    return render_template("admin_dashboard.html", metrics=metrics)
 
 
 @app.route("/search")
@@ -1180,7 +1202,7 @@ def evaluate_security_checks(test_name):
         "sql-injection": [
             ("Parameterized queries", payload_count == 0,
              "User input could alter the SQL statement", "Unauthorized data access",
-             "Injection payload returned zero product rows", "Parameterized SQLite placeholders"),
+             "Injection payload returned zero product rows", "Parameterized database placeholders"),
             ("Injection payload rejection", payload_count == 0,
              "A tautology payload could broaden search results", "Data disclosure",
              "The tautology payload was treated as ordinary text", "Bound query parameters"),
@@ -1433,7 +1455,7 @@ def unblock_user(user_id):
         (False, user_id),
     )
     db.commit()
-    log_event("User unblocked", "SUCCESS")
+    log_event(f"User unblocked account #{user_id}", "SUCCESS")
     flash(f"{row['username']} is now unblocked.", "success")
     return redirect(url_for("admin_users"))
 
@@ -1455,7 +1477,7 @@ def reset_data(data_set):
     label, tables = reset_map[data_set]
     db = get_db()
     for table in tables:
-        db.execute(f"DELETE FROM {table}")
+        db.execute(f"DELETE FROM {table} WHERE id IS NOT NULL")
     db.commit()
     log_event(f"Admin reset: {label}", "SUCCESS")
     flash(f"{label} completed.", "success")
@@ -1492,7 +1514,6 @@ def admin_login_history():
         FROM login_history l
         JOIN users u ON u.id = l.user_id
         ORDER BY l.id DESC
-        LIMIT 500
         """
     ).fetchall()
     return render_template("admin_login_history.html", history=history)
@@ -1501,7 +1522,7 @@ def admin_login_history():
 @app.route("/admin/logs")
 @admin_required
 def admin_logs():
-    logs = get_db().execute("SELECT * FROM security_logs ORDER BY id DESC LIMIT 100").fetchall()
+    logs = get_db().execute("SELECT * FROM security_logs ORDER BY id DESC").fetchall()
     return render_template("admin_logs.html", logs=logs)
 
 

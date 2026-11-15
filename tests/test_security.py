@@ -335,6 +335,29 @@ class SecureGateSecurityTests(unittest.TestCase):
         self.assertEqual(report.status_code, 200)
         self.assertIn(b"Test Name", report.data)
 
+    def test_dashboard_is_compact_and_user_scoped(self):
+        self.login()
+        dashboard = self.client.get("/dashboard")
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn(b"Total Tests Executed", dashboard.data)
+        self.assertNotIn(b"Total Users", dashboard.data)
+        self.assertNotIn(b"Blocked Users", dashboard.data)
+        self.assertNotIn(b"metric-value my-3", dashboard.data)
+
+    def test_product_search_uses_database_parameters(self):
+        self.login()
+        for query, product_name in (
+            ("Web Login Portal", b"Web Login Portal"),
+            ("SQL Injection Test Module", b"SQL Injection Test Module"),
+            ("XSS Test Module", b"XSS Test Module"),
+            ("Access Control Checker", b"Access Control Checker"),
+        ):
+            response = self.client.get("/search", query_string={"q": query})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(product_name, response.data)
+        injection = self.client.get("/search", query_string={"q": "' OR '1'='1"})
+        self.assertIn(b"No products matched", injection.data)
+
     def test_xss_and_sql_injection_handling(self):
         self.login()
         blocked = self.client.post(
@@ -370,7 +393,36 @@ class SecureGateSecurityTests(unittest.TestCase):
 
     def test_user_cannot_access_admin(self):
         self.login()
+        self.assertEqual(self.client.get("/admin").status_code, 403)
         self.assertEqual(self.client.get("/admin/users").status_code, 403)
+        self.assertNotIn(b"Admin", self.client.get("/dashboard").data)
+
+    def test_admin_dashboard_and_menu_are_admin_only(self):
+        self.login("admin", "Admin@123")
+        self.assertEqual(self.client.get("/admin").status_code, 200)
+        dashboard = self.client.get("/dashboard")
+        self.assertIn(b"Admin", dashboard.data)
+        self.assertIn(b"Admin global summary", dashboard.data)
+
+    def test_registration_cannot_assign_admin_role(self):
+        username = "role_form_user"
+        token = self.csrf("/register")
+        response = self.client.post(
+            "/register",
+            data={
+                "username": username,
+                "password": "RoleForm@123",
+                "role": "admin",
+                "csrf_token": token,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        db = sqlite3.connect(app.config["DATABASE"])
+        role = db.execute(
+            "SELECT role FROM users WHERE username = ?", (username,)
+        ).fetchone()[0]
+        db.close()
+        self.assertEqual(role, "user")
 
     def test_user_scoped_history_audit_and_pending_tests(self):
         self.login()
@@ -431,7 +483,7 @@ class SecureGateSecurityTests(unittest.TestCase):
         original_execute = DatabaseConnection.execute
 
         def fail_dashboard_query(connection, query, parameters=()):
-            if query.startswith("SELECT COUNT(*) FROM users"):
+            if query.startswith("SELECT COUNT(*) FROM security_tests"):
                 raise DatabaseError("dashboard query unavailable")
             return original_execute(connection, query, parameters)
 
