@@ -10,19 +10,28 @@ database_url = (
     or os.environ.get("DATABASE_URL_UNPOOLED")
 )
 
-if not secret_key:
-    raise RuntimeError("SECRET_KEY must be configured in Vercel environment variables")
-if not database_url:
-    raise RuntimeError("DATABASE_URL must be configured with the Neon PostgreSQL URL")
-
-os.environ["SECRET_KEY"] = secret_key
-os.environ["DATABASE_URL"] = normalize_database_url(database_url)
+if secret_key:
+    os.environ["SECRET_KEY"] = secret_key
+if database_url:
+    os.environ["DATABASE_URL"] = normalize_database_url(database_url)
 
 from app import app, init_db
 
-try:
-    with app.app_context():
-        init_db()
-except DatabaseError as error:
-    app.logger.error("Vercel database initialization failed: %s", error, exc_info=True)
-    raise
+@app.before_request
+def initialize_database():
+    if app.extensions.get("securegate_database_ready"):
+        return None
+    if not secret_key:
+        app.logger.error("Vercel SECRET_KEY/SESSION_SECRET is not configured")
+        return "Application configuration is incomplete.", 503
+    if not database_url:
+        app.logger.error("Vercel database URL is not configured")
+        return "Database configuration is incomplete.", 503
+    try:
+        with app.app_context():
+            init_db()
+    except (DatabaseError, RuntimeError) as error:
+        app.logger.error("Vercel database initialization failed: %s", error, exc_info=True)
+        return "Database initialization is temporarily unavailable.", 503
+    app.extensions["securegate_database_ready"] = True
+    return None
