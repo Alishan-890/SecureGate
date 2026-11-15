@@ -5,3 +5,5 @@ venv/
 securegate.db
 .env
 .pytest_cache/
+.vercel
+.env*
