@@ -3,7 +3,11 @@ import re
 import sqlite3
 
 
-class DatabaseIntegrityError(Exception):
+class DatabaseError(Exception):
+    """Raised when the database cannot serve an application query."""
+
+
+class DatabaseIntegrityError(DatabaseError):
     """Raised when a database constraint rejects a write."""
 
 
@@ -52,6 +56,15 @@ class DatabaseConnection:
             return DatabaseCursor(cursor, self.postgres).execute(query, parameters)
         except (sqlite3.IntegrityError, _postgres_integrity_error()) as error:
             raise DatabaseIntegrityError(str(error)) from error
+        except sqlite3.Error as error:
+            raise DatabaseError(str(error)) from error
+        except Exception as error:
+            if self.postgres:
+                import psycopg
+
+                if isinstance(error, psycopg.Error):
+                    raise DatabaseError(str(error)) from error
+            raise
 
     def executemany(self, query, parameters):
         try:
@@ -59,6 +72,15 @@ class DatabaseConnection:
             return DatabaseCursor(cursor, self.postgres).executemany(query, parameters)
         except (sqlite3.IntegrityError, _postgres_integrity_error()) as error:
             raise DatabaseIntegrityError(str(error)) from error
+        except sqlite3.Error as error:
+            raise DatabaseError(str(error)) from error
+        except Exception as error:
+            if self.postgres:
+                import psycopg
+
+                if isinstance(error, psycopg.Error):
+                    raise DatabaseError(str(error)) from error
+            raise
 
     def executescript(self, script):
         for statement in script.split(";"):
@@ -93,7 +115,11 @@ def connect(config):
             import psycopg
         except ImportError as error:
             raise RuntimeError("psycopg is required when DATABASE_URL is configured") from error
-        return DatabaseConnection(psycopg.connect(database_url), postgres=True)
+        try:
+            connection = psycopg.connect(database_url)
+        except psycopg.Error as error:
+            raise DatabaseError(str(error)) from error
+        return DatabaseConnection(connection, postgres=True)
     raise RuntimeError(
         "DATABASE_URL must be configured for production. "
         "Use the Neon PostgreSQL connection string."

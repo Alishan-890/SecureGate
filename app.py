@@ -19,7 +19,7 @@ from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from db import DatabaseIntegrityError, connect
+from db import DatabaseError, DatabaseIntegrityError, connect
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -243,8 +243,23 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    try:
+        row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    except DatabaseError:
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+        return None
     return User(row) if row else None
+
+
+@app.errorhandler(DatabaseError)
+def handle_database_error(error):
+    app.logger.error("Database request failed: %s", error)
+    if current_user.is_authenticated:
+        logout_user()
+    flash("Your session could not be restored. Please sign in again.", "warning")
+    return redirect(url_for("login"))
 
 
 def admin_required(view):

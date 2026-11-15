@@ -137,6 +137,16 @@ class SecureGateSecurityTests(unittest.TestCase):
         dashboard = self.client.get("/dashboard")
         self.assertIn(b"Recent security events", dashboard.data)
 
+    def test_dashboard_redirects_when_stale_session_has_no_database_schema(self):
+        self.database.unlink()
+        app.config["DATABASE"] = str(self.database)
+        with self.client.session_transaction() as session:
+            session["_user_id"] = "1"
+            session["_fresh"] = True
+        response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].startswith("/login"))
+
     def test_admin_can_block_and_unblock_users(self):
         self.login("admin", "Admin@123")
         token = self.csrf("/admin/users")
