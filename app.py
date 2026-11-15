@@ -219,6 +219,10 @@ def init_db():
         ):
             if column not in test_columns:
                 db.execute(f"ALTER TABLE security_tests ADD COLUMN {column} TEXT")
+    db.execute(
+        "UPDATE security_tests SET status = 'Not Run' "
+        "WHERE status = 'Pending' AND result IS NULL"
+    )
     if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
         initial_password = os.environ.get("INITIAL_ADMIN_PASSWORD")
