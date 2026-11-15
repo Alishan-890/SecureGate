@@ -43,6 +43,7 @@ TEST_NAV = (
 _DATABASE_INITIALIZED = False
 _LAST_SCHEMA_FAILURE = None
 _SCHEMA_FAILURE_STEPS = []
+SCHEMA_ADVISORY_LOCK = 918273645
 
 app = Flask(__name__)
 app.config.update(
@@ -241,6 +242,7 @@ def init_db():
     global _LAST_SCHEMA_FAILURE, _SCHEMA_FAILURE_STEPS
     _LAST_SCHEMA_FAILURE = None
     _SCHEMA_FAILURE_STEPS = []
+    schema_lock_acquired = False
     try:
         db = connect(app.config)
     except (DatabaseError, RuntimeError) as error:
@@ -248,6 +250,17 @@ def init_db():
         raise
     try:
         if db.postgres:
+            schema_lock_acquired = _acquire_schema_lock(db)
+            if not schema_lock_acquired:
+                try:
+                    db.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+                    db.execute("SELECT 1 FROM security_tests LIMIT 1").fetchone()
+                    db.commit()
+                    return
+                except DatabaseError as error:
+                    _LAST_SCHEMA_FAILURE = error
+                    _SCHEMA_FAILURE_STEPS.append("schema_lock_wait")
+                    return
             migration = (BASE_DIR / "migrations" / "001_initial.sql").read_text(
                 encoding="utf-8"
             )
@@ -321,7 +334,37 @@ def init_db():
             _seed_product(db, product_id, product)
         db.commit()
     finally:
+        if schema_lock_acquired:
+            _release_schema_lock(db)
         db.close()
+
+
+def _acquire_schema_lock(db):
+    global _LAST_SCHEMA_FAILURE
+    try:
+        row = db.execute(
+            "SELECT pg_try_advisory_lock(?) AS acquired",
+            (SCHEMA_ADVISORY_LOCK,),
+        ).fetchone()
+        db.commit()
+        return bool(row and row["acquired"])
+    except DatabaseError as error:
+        db.rollback()
+        _LAST_SCHEMA_FAILURE = error
+        _SCHEMA_FAILURE_STEPS.append("schema_lock")
+        log_database_error("schema step schema_lock", error)
+        return False
+
+
+def _release_schema_lock(db):
+    try:
+        db.execute(
+            "SELECT pg_advisory_unlock(?)",
+            (SCHEMA_ADVISORY_LOCK,),
+        )
+        db.commit()
+    except DatabaseError as error:
+        log_database_error("schema step schema_unlock", error)
 
 
 def _run_schema_step(db, name, statement, parameters=()):
