@@ -18,6 +18,7 @@ from flask_login import (
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from db import DatabaseError, DatabaseIntegrityError, connect
 
@@ -49,6 +50,7 @@ app.config.update(
         "SECUREGATE_HTTPS", "1" if os.environ.get("VERCEL") else "0"
     ) == "1",
 )
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 csrf = CSRFProtect(app)
 login_manager = LoginManager()
 login_manager.login_view = "login"
@@ -116,6 +118,10 @@ def pkt_now():
 
 def pkt_now_iso():
     return pkt_now().isoformat(timespec="seconds")
+
+
+def normalize_username(value):
+    return value.strip().casefold()
 
 
 def parse_timestamp(value):
@@ -289,8 +295,8 @@ class User(UserMixin):
 def load_user(user_id):
     try:
         row = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    except DatabaseError as error:
-        app.logger.error("Unable to restore session user %s: %s", user_id, error)
+    except DatabaseError:
+        app.logger.exception("Unable to restore session user %s", user_id)
         db = g.pop("db", None)
         if db is not None:
             db.close()
@@ -341,7 +347,7 @@ def index():
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
+        username = normalize_username(request.form.get("username", ""))
         password = request.form.get("password", "")
         if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
             flash("Use 3-30 letters, numbers, or underscores.", "danger")
@@ -366,7 +372,7 @@ def register():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
+        username = normalize_username(request.form.get("username", ""))
         password = request.form.get("password", "")
         if not username or not password:
             flash("Enter both a username and password.", "danger")

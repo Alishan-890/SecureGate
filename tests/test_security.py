@@ -41,6 +41,43 @@ class SecureGateSecurityTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 302)
 
+    def test_register_commit_then_login_and_access_dashboard(self):
+        username = "new_registered_user"
+        password = "NewRegistered@123"
+        token = self.csrf("/register")
+        registered = self.client.post(
+            "/register",
+            data={"username": username, "password": password, "csrf_token": token},
+        )
+        self.assertEqual(registered.status_code, 302)
+        db = sqlite3.connect(app.config["DATABASE"])
+        self.assertIsNotNone(
+            db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        )
+        db.close()
+        login = self.login(username, password)
+        self.assertEqual(login.status_code, 302)
+        self.assertEqual(self.client.get("/dashboard").status_code, 200)
+
+    def test_wrong_password_is_recorded_as_boolean_failure(self):
+        response = self.login("student", "WrongPassword@123")
+        self.assertEqual(response.status_code, 200)
+        db = sqlite3.connect(app.config["DATABASE"])
+        result = db.execute(
+            "SELECT success FROM login_history WHERE user_id = "
+            "(SELECT id FROM users WHERE username = 'student') ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        db.close()
+        self.assertEqual(result, 0)
+
+    def test_invalid_session_user_id_redirects_without_crashing(self):
+        with self.client.session_transaction() as session:
+            session["_user_id"] = "999999"
+            session["_fresh"] = True
+        response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response.headers["Location"])
+
     def test_missing_and_invalid_csrf_are_rejected_and_logged(self):
         missing = self.client.post("/login", data={"username": "student", "password": "Student@123"})
         invalid = self.client.post(
