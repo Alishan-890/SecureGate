@@ -1,0 +1,113 @@
+import os
+import re
+import sqlite3
+
+
+class DatabaseIntegrityError(Exception):
+    """Raised when a database constraint rejects a write."""
+
+
+class HybridRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class DatabaseCursor:
+    def __init__(self, cursor, postgres):
+        self.cursor = cursor
+        self.postgres = postgres
+
+    def execute(self, query, parameters=()):
+        self.cursor.execute(
+            _postgres_placeholders(query) if self.postgres else query,
+            parameters,
+        )
+        return self
+
+    def executemany(self, query, parameters):
+        self.cursor.executemany(
+            _postgres_placeholders(query) if self.postgres else query,
+            parameters,
+        )
+        return self
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return _row(row, self.cursor.description) if row is not None else None
+
+    def fetchall(self):
+        return [_row(row, self.cursor.description) for row in self.cursor.fetchall()]
+
+
+class DatabaseConnection:
+    def __init__(self, connection, postgres):
+        self.connection = connection
+        self.postgres = postgres
+
+    def execute(self, query, parameters=()):
+        try:
+            cursor = self.connection.cursor()
+            return DatabaseCursor(cursor, self.postgres).execute(query, parameters)
+        except (sqlite3.IntegrityError, _postgres_integrity_error()) as error:
+            raise DatabaseIntegrityError(str(error)) from error
+
+    def executemany(self, query, parameters):
+        try:
+            cursor = self.connection.cursor()
+            return DatabaseCursor(cursor, self.postgres).executemany(query, parameters)
+        except (sqlite3.IntegrityError, _postgres_integrity_error()) as error:
+            raise DatabaseIntegrityError(str(error)) from error
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+        return self
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+
+def connect(config):
+    database_url = os.environ.get("DATABASE_URL") or config.get("DATABASE_URL")
+    if config.get("TESTING") and config.get("DATABASE"):
+        connection = sqlite3.connect(config["DATABASE"])
+        connection.row_factory = sqlite3.Row
+        return DatabaseConnection(connection, postgres=False)
+    if database_url:
+        try:
+            import psycopg
+        except ImportError as error:
+            raise RuntimeError("psycopg is required when DATABASE_URL is configured") from error
+        return DatabaseConnection(psycopg.connect(database_url), postgres=True)
+    raise RuntimeError(
+        "DATABASE_URL must be configured for production. "
+        "Use the Neon PostgreSQL connection string."
+    )
+
+
+def _postgres_integrity_error():
+    try:
+        import psycopg
+        return psycopg.errors.IntegrityError
+    except ImportError:
+        return type("_UnavailableIntegrityError", (Exception,), {})
+
+
+def _postgres_placeholders(query):
+    return re.sub(r"\?", "%s", query)
+
+
+def _row(row, description):
+    if isinstance(row, sqlite3.Row):
+        return row
+    names = [column[0] for column in description or ()]
+    return HybridRow(zip(names, row))
