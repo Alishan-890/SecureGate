@@ -383,6 +383,13 @@ class SecureGateSecurityTests(unittest.TestCase):
         dashboard = self.client.get("/dashboard")
         self.assertIn(b"Recent security events", dashboard.data)
         self.assertIn(b"Last login:", dashboard.data)
+        for product_name in (
+            b"Web Login Portal",
+            b"SQL Injection Test Module",
+            b"XSS Test Module",
+            b"Access Control Checker",
+        ):
+            self.assertIn(product_name, dashboard.data)
         self.assertRegex(history.data.decode(), r"\d{2} [A-Z][a-z]{2} \d{4}, \d{2}:\d{2} [AP]M PKT")
         self.assertEqual(self.client.get("/audit").status_code, 200)
 

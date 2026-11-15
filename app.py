@@ -1048,7 +1048,15 @@ def dashboard():
         "SELECT * FROM security_logs WHERE user_id = ? ORDER BY id DESC LIMIT 6",
         (current_user.id,),
     ).fetchall()
-    return render_template("dashboard.html", metrics=metrics, recent_logs=recent_logs)
+    products = db.execute(
+        "SELECT name, category, description, status FROM products ORDER BY id"
+    ).fetchall()
+    return render_template(
+        "dashboard.html",
+        metrics=metrics,
+        recent_logs=recent_logs,
+        products=products,
+    )
 
 
 @app.route("/search")
