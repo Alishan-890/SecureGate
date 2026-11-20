@@ -82,10 +82,11 @@ def statements():
             (
                 f"seed_product_{product_id}",
                 "INSERT INTO products (id, name, category, description, price, status) "
-                f"VALUES ({product_id}, '{name}', '{category}', '{description}', 0.00, 'Active') "
+                "VALUES (?, ?, ?, ?, 0.00, 'Active') "
                 "ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, "
                 "category = EXCLUDED.category, description = EXCLUDED.description, "
                 "price = EXCLUDED.price, status = EXCLUDED.status",
+                (product_id, name, category, description),
             )
         )
     return result
@@ -117,11 +118,14 @@ def main():
             print(f"FAIL connection: {type(error).__name__}: {masked_message(error)}")
             return 1
 
-        for name, statement in statements():
+        for step in statements():
+            name = step[0]
+            statement = step[1]
+            parameters = step[2] if len(step) == 3 else ()
             try:
                 with connection.transaction():
                     with connection.cursor() as cursor:
-                        cursor.execute(statement)
+                        cursor.execute(statement.replace("?", "%s"), parameters)
                 print(f"PASS {name}")
             except Exception as error:
                 connection.rollback()

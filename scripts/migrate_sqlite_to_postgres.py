@@ -15,6 +15,14 @@ TABLES = (
     "login_history",
     "security_tests",
 )
+TABLE_COLUMNS = {
+    "users": {"id", "username", "password_hash", "role", "failed_attempts", "locked_until", "created_at", "last_login", "is_blocked"},
+    "products": {"id", "name", "category", "description", "price", "status"},
+    "feedback": {"id", "user_id", "message", "created_at"},
+    "security_logs": {"id", "user_id", "username", "event", "result", "ip_address", "created_at"},
+    "login_history": {"id", "user_id", "success", "ip_address", "login_at"},
+    "security_tests": {"id", "user_id", "test_name", "status", "result", "details", "finding", "impact", "evidence", "applied_control", "retest_result", "risk_level", "created_at", "executed_at"},
+}
 
 
 def main():
@@ -30,6 +38,7 @@ def main():
             columns = [
                 row[1]
                 for row in source.execute(f"PRAGMA table_info({table})").fetchall()
+                if row[1] in TABLE_COLUMNS[table]
             ]
             rows = source.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()
             if not rows:

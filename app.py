@@ -499,52 +499,53 @@ def _product_catalog():
 
 
 def _seed_users(db):
-    try:
-        if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] != 0:
-            return
-    except DatabaseError as error:
-        global _LAST_SCHEMA_FAILURE
-        _LAST_SCHEMA_FAILURE = error
-        _SCHEMA_FAILURE_STEPS.append("seed_users_check")
-        log_database_error("schema step seed_users_check", error)
-        return
-    initial_admin = os.environ.get("INITIAL_ADMIN_USERNAME")
-    initial_password = os.environ.get("INITIAL_ADMIN_PASSWORD")
-    if not (app.config.get("TESTING") or (initial_admin and initial_password)):
-        return
-    now = pkt_now_iso()
-    admin_parameters = (
-        initial_admin or "admin",
-        generate_password_hash(initial_password or "Admin@123"),
-        now,
+    initial_admin = (
+        os.environ.get("INITIAL_ADMIN_USERNAME")
+        or os.environ.get("ADMIN_USERNAME")
+        or "admin"
     )
-    if db.postgres:
-        _run_schema_step(
-            db,
-            "seed_admin_user",
-            "INSERT INTO users (username, password_hash, role, created_at) "
-            "VALUES (?, ?, 'admin', ?)",
-            admin_parameters,
+    initial_password = (
+        os.environ.get("INITIAL_ADMIN_PASSWORD")
+        or os.environ.get("ADMIN_PASSWORD")
+        or "Admin@123"
+    )
+    initial_admin = normalize_username(initial_admin)
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", initial_admin):
+        raise RuntimeError("INITIAL_ADMIN_USERNAME must contain 3-30 letters, numbers, or underscores.")
+    if len(initial_password) < 8:
+        raise RuntimeError("INITIAL_ADMIN_PASSWORD must contain at least 8 characters.")
+    now = pkt_now_iso()
+    admin_hash = generate_password_hash(initial_password)
+    existing_admin = db.execute(
+        "SELECT id FROM users WHERE username = ?",
+        (initial_admin,),
+    ).fetchone()
+    if existing_admin:
+        db.execute(
+            "UPDATE users SET role = 'admin', password_hash = ?, failed_attempts = 0, "
+            "locked_until = NULL, is_blocked = FALSE WHERE id = ?",
+            (admin_hash, existing_admin["id"]),
         )
     else:
         db.execute(
             "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-            admin_parameters,
+            (initial_admin, admin_hash, now),
         )
     if app.config.get("TESTING"):
-        student_parameters = ("student", generate_password_hash("Student@123"), now)
-        if db.postgres:
-            _run_schema_step(
-                db,
-                "seed_student_user",
-                "INSERT INTO users (username, password_hash, role, created_at) "
-                "VALUES (?, ?, 'user', ?)",
-                student_parameters,
+        existing_student = db.execute(
+            "SELECT id FROM users WHERE username = ?",
+            ("student",),
+        ).fetchone()
+        if existing_student:
+            db.execute(
+                "UPDATE users SET password_hash = ?, role = 'user', failed_attempts = 0, "
+                "locked_until = NULL, is_blocked = FALSE WHERE id = ?",
+                (generate_password_hash("Student@123"), existing_student["id"]),
             )
         else:
             db.execute(
                 "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'user', ?)",
-                student_parameters,
+                ("student", generate_password_hash("Student@123"), now),
             )
 
 
@@ -1088,6 +1089,10 @@ def search():
     products = []
     if request.args and not query:
         flash("Enter a product, category, or keyword to search.", "warning")
+    elif query and (len(query) > 100 or re.search(r"[^\x20-\x7E]", query)):
+        flash("Search input contains unsupported characters.", "danger")
+        log_event("Search validation", "BLOCKED")
+        query = ""
     if query:
         products = get_db().execute(
             "SELECT * FROM products WHERE name LIKE ? OR category LIKE ? OR description LIKE ? ORDER BY name",
@@ -1104,7 +1109,10 @@ def feedback():
     if request.method == "POST":
         if not message or len(message) > 500:
             flash("Feedback must contain 1-500 characters.", "danger")
-        elif re.search(r"<\s*script|javascript\s*:", message, re.IGNORECASE):
+        elif re.search(r"[^\x09\x0A\x0D\x20-\x7E]", message):
+            log_event("Feedback validation", "BLOCKED")
+            flash("Feedback contains unsupported control characters.", "danger")
+        elif re.search(r"<\s*script|javascript\s*:|on[a-z]+\s*=", message, re.IGNORECASE):
             log_event("Feedback validation", "BLOCKED")
             flash("Potentially unsafe markup was blocked.", "danger")
         else:
